@@ -49,6 +49,7 @@
 volatile uint32_t capture1 = 0;
 volatile uint32_t sharedPulseWidth = 0;
 volatile uint8_t isFirstCaptured = 0;
+volatile uint32_t lastPulseTime = 0;  // Thời điểm nhận được xung PWM cuối cùng
 
 // Mảng thời gian SOS [cite: 4]
 const unsigned int sosDelays[] = {
@@ -90,6 +91,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         sharedPulseWidth = (0xFFFFFFFF - capture1) + capture2 + 1; // Xử lý tràn (overflow)
       }
       
+      lastPulseTime = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
       isFirstCaptured = 0;
       // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
       __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
@@ -161,6 +163,16 @@ int main(void)
   {
     // HAL_Delay(1000);
     // printf("Test 1 \n");
+    // HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+
+    // printf("SharedPulseWidth: %d \n", sharedPulseWidth);
+
+    // Kiểm tra timeout: nếu không có xung trong 50ms thì reset về 0
+    if (HAL_GetTick() - lastPulseTime > 50) {
+      __disable_irq();
+      sharedPulseWidth = 0;
+      __enable_irq();
+    }
 
     // Truy xuất an toàn giá trị xung [cite: 10]
     __disable_irq(); // Tương đương noInterrupts()
