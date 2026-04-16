@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32g4xx_hal_gpio.h"
 #include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
@@ -50,6 +49,16 @@ volatile uint32_t capture1 = 0;
 volatile uint32_t sharedPulseWidth = 0;
 volatile uint8_t isFirstCaptured = 0;
 volatile uint32_t lastPulseTime = 0;  // Thời điểm nhận được xung PWM cuối cùng
+
+volatile uint32_t capture1_ch2 = 0;
+volatile uint32_t sharedPulseWidth_ch2 = 0;
+volatile uint8_t isFirstCaptured_ch2 = 0;
+volatile uint32_t lastPulseTime_ch2 = 0;
+
+volatile uint32_t capture1_ch3 = 0;
+volatile uint32_t sharedPulseWidth_ch3 = 0;
+volatile uint8_t isFirstCaptured_ch3 = 0;
+volatile uint32_t lastPulseTime_ch3 = 0;
 
 // Mảng thời gian SOS [cite: 4]
 const unsigned int sosDelays[] = {
@@ -95,6 +104,58 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
       isFirstCaptured = 0;
       // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
       __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
+    }
+  }
+
+  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+  {
+    if (isFirstCaptured_ch2 == 0) // Bắt được cạnh LÊN
+    {
+      capture1_ch2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+      isFirstCaptured_ch2 = 1;
+      // Đảo cực để chờ bắt cạnh XUỐNG
+      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_FALLING);
+    }
+    else // Bắt được cạnh XUỐNG
+    {
+      uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+      
+      if (capture2 > capture1_ch2) {
+        sharedPulseWidth_ch2 = capture2 - capture1_ch2; // Tính ra số microgiây
+      } else {
+        sharedPulseWidth_ch2 = (0xFFFFFFFF - capture1_ch2) + capture2 + 1; // Xử lý tràn (overflow)
+      }
+      
+      lastPulseTime_ch2 = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
+      isFirstCaptured_ch2 = 0;
+      // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
+      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
+    }
+  }
+
+  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3)
+  {
+    if (isFirstCaptured_ch3 == 0) // Bắt được cạnh LÊN
+    {
+      capture1_ch3 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+      isFirstCaptured_ch3 = 1;
+      // Đảo cực để chờ bắt cạnh XUỐNG
+      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3, TIM_INPUTCHANNELPOLARITY_FALLING);
+    }
+    else // Bắt được cạnh XUỐNG
+    {
+      uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+      
+      if (capture2 > capture1_ch3) {
+        sharedPulseWidth_ch3 = capture2 - capture1_ch3; // Tính ra số microgiây
+      } else {
+        sharedPulseWidth_ch3 = (0xFFFFFFFF - capture1_ch3) + capture2 + 1; // Xử lý tràn (overflow)
+      }
+      
+      lastPulseTime_ch3 = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
+      isFirstCaptured_ch3 = 0;
+      // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
+      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3, TIM_INPUTCHANNELPOLARITY_RISING);
     }
   }
 }
@@ -150,11 +211,23 @@ int main(void)
   MX_GPIO_Init();
   MX_USB_Device_Init();
   MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  // Khởi động Timer xuất PWM trước tiên
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+
+  // Đưa servo về 0 độ (tương ứng xung 500us)
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 500);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 500);
+
+  // Cấp xung trong 1 giây để servo có đủ thời gian quay về gốc
   HAL_Delay(1000);
 
-  // Khởi động Timer ngắt Input Capture
+  // Sau đó mới khởi động Timer ngắt Input Capture
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -173,11 +246,43 @@ int main(void)
       sharedPulseWidth = 0;
       __enable_irq();
     }
+    if (HAL_GetTick() - lastPulseTime_ch2 > 50) {
+      __disable_irq();
+      sharedPulseWidth_ch2 = 0;
+      __enable_irq();
+    }
+    if (HAL_GetTick() - lastPulseTime_ch3 > 50) {
+      __disable_irq();
+      sharedPulseWidth_ch3 = 0;
+      __enable_irq();
+    }
 
     // Truy xuất an toàn giá trị xung [cite: 10]
     __disable_irq(); // Tương đương noInterrupts()
     uint32_t currentPulse = sharedPulseWidth;
+    uint32_t currentPulse_ch2 = sharedPulseWidth_ch2;
+    uint32_t currentPulse_ch3 = sharedPulseWidth_ch3;
     __enable_irq();  // Tương đương interrupts()
+
+    // Xuất xung ra PWM cho servo CH2 (ánh xạ 1000-2000us sang 500-2500us)
+    if (currentPulse_ch2 > 0) {
+      int32_t outPWM2 = ((int32_t)currentPulse_ch2 - 1000) * 2 + 500;
+      if (outPWM2 < 500) outPWM2 = 500;   // Giới hạn dưới 500us (0 độ)
+      if (outPWM2 > 2500) outPWM2 = 2500; // Giới hạn trên 2500us (180 độ)
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)outPWM2);
+    } else {
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0); // Mất tín hiệu, tắt PWM
+    }
+
+    // Xuất xung ra PWM cho servo CH3 (ánh xạ 1000-2000us sang 500-2500us)
+    if (currentPulse_ch3 > 0) {
+      int32_t outPWM3 = ((int32_t)currentPulse_ch3 - 1000) * 2 + 500;
+      if (outPWM3 < 500) outPWM3 = 500;   // Giới hạn dưới 500us (0 độ)
+      if (outPWM3 > 2500) outPWM3 = 2500; // Giới hạn trên 2500us (180 độ)
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, (uint32_t)outPWM3);
+    } else {
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0); // Mất tín hiệu, tắt PWM
+    }
 
     // 1. Mức cao nhất (>1750us): Chế độ SOS [cite: 11]
     if (currentPulse > 1750) {
