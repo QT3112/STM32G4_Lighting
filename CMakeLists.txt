@@ -46,11 +46,13 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/retarget.c
+    Core/Src/crsf.c        # Thư viện giao tiếp ELRS (giao thức CRSF)
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    Core/Inc                # Chứa crsf.h và các header người dùng
 )
 
 # Add project symbols (macros)
