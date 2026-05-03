@@ -93,14 +93,20 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     else // Bắt được cạnh XUỐNG
     {
       uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+      uint32_t pulse;
       
       if (capture2 > capture1) {
-        sharedPulseWidth = capture2 - capture1; // Tính ra số microgiây
+        pulse = capture2 - capture1;
       } else {
-        sharedPulseWidth = (0xFFFFFFFF - capture1) + capture2 + 1; // Xử lý tràn (overflow)
+        pulse = (0xFFFFFFFF - capture1) + capture2 + 1; // Xử lý tràn (overflow)
       }
       
-      lastPulseTime = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
+      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
+      if (pulse >= 800 && pulse <= 2200) {
+        sharedPulseWidth = pulse;
+        lastPulseTime = HAL_GetTick();
+      }
+      
       isFirstCaptured = 0;
       // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
       __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
@@ -119,14 +125,20 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     else // Bắt được cạnh XUỐNG
     {
       uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-      
+      uint32_t pulse_ch2;
+
       if (capture2 > capture1_ch2) {
-        sharedPulseWidth_ch2 = capture2 - capture1_ch2; // Tính ra số microgiây
+        pulse_ch2 = capture2 - capture1_ch2;
       } else {
-        sharedPulseWidth_ch2 = (0xFFFFFFFF - capture1_ch2) + capture2 + 1; // Xử lý tràn (overflow)
+        pulse_ch2 = (0xFFFFFFFF - capture1_ch2) + capture2 + 1; // Xử lý tràn (overflow)
       }
-      
-      lastPulseTime_ch2 = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
+
+      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
+      if (pulse_ch2 >= 800 && pulse_ch2 <= 2200) {
+        sharedPulseWidth_ch2 = pulse_ch2;
+        lastPulseTime_ch2 = HAL_GetTick();
+      }
+
       isFirstCaptured_ch2 = 0;
       // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
       __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
@@ -145,14 +157,20 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     else // Bắt được cạnh XUỐNG
     {
       uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
-      
+      uint32_t pulse_ch3;
+
       if (capture2 > capture1_ch3) {
-        sharedPulseWidth_ch3 = capture2 - capture1_ch3; // Tính ra số microgiây
+        pulse_ch3 = capture2 - capture1_ch3;
       } else {
-        sharedPulseWidth_ch3 = (0xFFFFFFFF - capture1_ch3) + capture2 + 1; // Xử lý tràn (overflow)
+        pulse_ch3 = (0xFFFFFFFF - capture1_ch3) + capture2 + 1; // Xử lý tràn (overflow)
       }
-      
-      lastPulseTime_ch3 = HAL_GetTick(); // Ghi lại thời điểm nhận xung hợp lệ
+
+      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
+      if (pulse_ch3 >= 800 && pulse_ch3 <= 2200) {
+        sharedPulseWidth_ch3 = pulse_ch3;
+        lastPulseTime_ch3 = HAL_GetTick();
+      }
+
       isFirstCaptured_ch3 = 0;
       // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
       __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3, TIM_INPUTCHANNELPOLARITY_RISING);
@@ -165,11 +183,11 @@ void handleSOS() {
   if (HAL_GetTick() - lastSosMillis >= sosDelays[sosStep]) {
     lastSosMillis = HAL_GetTick();
     
-    // Bước chẵn là sáng, lẻ là tắt [cite: 17, 18]
+    // Bước chẵn là sáng (ON), lẻ là tắt (OFF)
     if (sosStep % 2 == 0) {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET); // sáng hoàn toàn
     } else {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET); // tắt hoàn toàn
     }
 
     sosStep++;
@@ -213,16 +231,24 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  // Khởi động Timer xuất PWM trước tiên
+  // Khởi động Timer xuất PWM cho servo
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
 
-  // Đưa servo về 0 độ (tương ứng xung 500us)
+  // Tắt đèn mặc định và đưa servo về 0 độ (tương ứng xung 500us)
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 500);
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 500);
 
   // Cấp xung trong 1 giây để servo có đủ thời gian quay về gốc
   HAL_Delay(1000);
+
+  // Khởi tạo lastPulseTime SAU delay để tránh timeout kích hoạt ngay lập tức
+  // (nếu để = 0, điều kiện HAL_GetTick() - 0 > 50 đúng ngay, gây reset sai)
+  uint32_t now = HAL_GetTick();
+  lastPulseTime     = now;
+  lastPulseTime_ch2 = now;
+  lastPulseTime_ch3 = now;
 
   // Sau đó mới khởi động Timer ngắt Input Capture
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
@@ -289,8 +315,8 @@ int main(void)
       // printf("SOS \n");
       handleSOS();
     }
-    // 2. Mức thấp nhất (500us - 1250us): Bật sáng (ON) [cite: 12, 13]
-    else if (currentPulse < 1250 && currentPulse > 500) {
+    // 2. Mức thấp nhất (1000us - 1250us): Bật sáng (ON)
+    else if (currentPulse >= 1000 && currentPulse < 1250) {
       // printf("Lighting ON \n");
       HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
       sosStep = 0; 
