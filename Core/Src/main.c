@@ -28,6 +28,7 @@
 #include "rc_input.h"
 #include "servo_control.h"
 #include "lighting_control.h"
+#include "mode_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -117,7 +118,10 @@ int main(void)
   /* 4. Khởi tạo RC Input (ghi lastPulseTime = now sau delay, tránh timeout sớm) */
   RC_Input_Init();
 
-  /* 5. Khởi động Input Capture ngắt */
+  /* 5. Khởi tạo bộ quản lý chế độ (mặc định: NORMAL) */
+  Mode_Init();
+
+  /* 6. Khởi động Input Capture ngắt */
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
@@ -128,11 +132,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* === CHẾ ĐỘ DEMO (bỏ comment dòng dưới để chạy demo tự động) === */
-    // Demo_Performance();
-
-    /* === CHẾ ĐỘ ĐIỀU KHIỂN BÌNH THƯỜNG ================================ */
-
     /* 1. Cập nhật timeout, reset pulse nếu mất tín hiệu */
     RC_Input_Update();
 
@@ -141,11 +140,22 @@ int main(void)
     uint32_t ch2 = RC_Input_GetCh2();
     uint32_t ch3 = RC_Input_GetCh3();
 
-    /* 3. Cập nhật vị trí servo */
-    Servo_Update(ch2, ch3);
+    /* 3. Cập nhật bộ phát hiện cử chỉ toggle chế độ
+          (luôn chạy dù đang ở chế độ nào) */
+    Mode_Update(ch1);
 
-    /* 4. Cập nhật trạng thái đèn */
-    Lighting_Update(ch1);
+    /* 4. Điều phối theo chế độ hiện tại */
+    if (Mode_Get() == APP_MODE_DEMO)
+    {
+      /* CHẾ ĐỘ DEMO: đèn do Demo_Performance() điều khiển */
+      Demo_Performance();
+    }
+    else
+    {
+      /* CHẾ ĐỘ NORMAL: servo + đèn theo tín hiệu RC */
+      Servo_Update(ch2, ch3);
+      Lighting_Update(ch1);
+    }
 
     /* USER CODE END WHILE */
 

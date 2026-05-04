@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/rc_input.c
     Core/Src/servo_control.c
     Core/Src/lighting_control.c
+    Core/Src/mode_manager.c
 )
 
 # Add include paths

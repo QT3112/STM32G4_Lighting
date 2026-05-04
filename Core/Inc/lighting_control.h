@@ -14,7 +14,7 @@
 
 /* Ngưỡng điều khiển đèn (µs) ---------------------------------------------- */
 #define LIGHT_ZONE_SOS_THRESHOLD    1750U   /* > giá trị này → SOS      */
-#define LIGHT_ZONE_ON_MIN           1000U   /* ≥ giá trị này → ON zone  */
+#define LIGHT_ZONE_ON_MIN           750U   /* ≥ giá trị này → ON zone  */
 #define LIGHT_ZONE_ON_MAX           1250U   /* <  giá trị này → ON zone */
 
 /* Chân GPIO đèn ------------------------------------------------------------ */

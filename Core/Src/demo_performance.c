@@ -17,13 +17,14 @@
 /* Includes ------------------------------------------------------------------*/
 #include "demo_performance.h"
 
-/* External variables --------------------------------------------------------*/
-/* Biến SOS được định nghĩa trong main.c – dùng chung để tái sử dụng handleSOS() */
-extern int      sosStep;
-extern uint32_t lastSosMillis;
-
-/* Biến SOS delays được định nghĩa trong main.c */
-extern const unsigned int sosDelays[];
+/* Private SOS variables for demo performance */
+static int sosStep = 0;
+static uint32_t lastSosMillis = 0;
+static const unsigned int sosDelays[] = {
+  150, 150, 150, 150, 150, 450,  /* S */
+  450, 150, 450, 150, 450, 450,  /* O */
+  150, 150, 150, 150, 150, 1050  /* S */
+};
 
 /* Private variables ---------------------------------------------------------*/
 static DemoStep_t demoStep            = DEMO_STEP1_LIGHT_OFF;
