@@ -25,6 +25,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "demo_performance.h"
+#include "rc_input.h"
+#include "servo_control.h"
+#include "lighting_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,29 +48,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile uint32_t capture1 = 0;
-volatile uint32_t sharedPulseWidth = 0;
-volatile uint8_t isFirstCaptured = 0;
-volatile uint32_t lastPulseTime = 0;  // Thời điểm nhận được xung PWM cuối cùng
-
-volatile uint32_t capture1_ch2 = 0;
-volatile uint32_t sharedPulseWidth_ch2 = 0;
-volatile uint8_t isFirstCaptured_ch2 = 0;
-volatile uint32_t lastPulseTime_ch2 = 0;
-
-volatile uint32_t capture1_ch3 = 0;
-volatile uint32_t sharedPulseWidth_ch3 = 0;
-volatile uint8_t isFirstCaptured_ch3 = 0;
-volatile uint32_t lastPulseTime_ch3 = 0;
-
-// Mảng thời gian SOS [cite: 4]
-const unsigned int sosDelays[] = {
-  150, 150, 150, 150, 150, 450,  // S
-  450, 150, 450, 150, 450, 450,  // O
-  150, 150, 150, 150, 150, 1050  // S
-};
-int sosStep = 0;
-uint32_t lastSosMillis = 0;
+/* Tất cả biến shared đã được chuyển vào rc_input.c (static nội bộ).       */
+/* Truy xuất qua RC_Input_GetCh1/2/3().                                      */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -78,123 +60,13 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// Hàm ngắt này tự động được gọi khi chân TIM2_CH1 bắt được cạnh xung
+
+/**
+ * @brief HAL callback cho TIM2 Input Capture – ủy quyền sang rc_input.c.
+ */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
-  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
-  {
-    if (isFirstCaptured == 0) // Bắt được cạnh LÊN
-    {
-      capture1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-      isFirstCaptured = 1;
-      // Đảo cực để chờ bắt cạnh XUỐNG
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_FALLING);
-    }
-    else // Bắt được cạnh XUỐNG
-    {
-      uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-      uint32_t pulse;
-      
-      if (capture2 > capture1) {
-        pulse = capture2 - capture1;
-      } else {
-        pulse = (0xFFFFFFFF - capture1) + capture2 + 1; // Xử lý tràn (overflow)
-      }
-      
-      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
-      if (pulse >= 800 && pulse <= 2200) {
-        sharedPulseWidth = pulse;
-        lastPulseTime = HAL_GetTick();
-      }
-      
-      isFirstCaptured = 0;
-      // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1, TIM_INPUTCHANNELPOLARITY_RISING);
-    }
-  }
-
-  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
-  {
-    if (isFirstCaptured_ch2 == 0) // Bắt được cạnh LÊN
-    {
-      capture1_ch2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-      isFirstCaptured_ch2 = 1;
-      // Đảo cực để chờ bắt cạnh XUỐNG
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_FALLING);
-    }
-    else // Bắt được cạnh XUỐNG
-    {
-      uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-      uint32_t pulse_ch2;
-
-      if (capture2 > capture1_ch2) {
-        pulse_ch2 = capture2 - capture1_ch2;
-      } else {
-        pulse_ch2 = (0xFFFFFFFF - capture1_ch2) + capture2 + 1; // Xử lý tràn (overflow)
-      }
-
-      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
-      if (pulse_ch2 >= 800 && pulse_ch2 <= 2200) {
-        sharedPulseWidth_ch2 = pulse_ch2;
-        lastPulseTime_ch2 = HAL_GetTick();
-      }
-
-      isFirstCaptured_ch2 = 0;
-      // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2, TIM_INPUTCHANNELPOLARITY_RISING);
-    }
-  }
-
-  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3)
-  {
-    if (isFirstCaptured_ch3 == 0) // Bắt được cạnh LÊN
-    {
-      capture1_ch3 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
-      isFirstCaptured_ch3 = 1;
-      // Đảo cực để chờ bắt cạnh XUỐNG
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3, TIM_INPUTCHANNELPOLARITY_FALLING);
-    }
-    else // Bắt được cạnh XUỐNG
-    {
-      uint32_t capture2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
-      uint32_t pulse_ch3;
-
-      if (capture2 > capture1_ch3) {
-        pulse_ch3 = capture2 - capture1_ch3;
-      } else {
-        pulse_ch3 = (0xFFFFFFFF - capture1_ch3) + capture2 + 1; // Xử lý tràn (overflow)
-      }
-
-      // Chỉ chấp nhận xung nằm trong dải hợp lệ RC PWM (800–2200us), loại bỏ nhiễu
-      if (pulse_ch3 >= 800 && pulse_ch3 <= 2200) {
-        sharedPulseWidth_ch3 = pulse_ch3;
-        lastPulseTime_ch3 = HAL_GetTick();
-      }
-
-      isFirstCaptured_ch3 = 0;
-      // Đảo cực lại để chờ cạnh LÊN của chu kỳ tiếp theo
-      __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3, TIM_INPUTCHANNELPOLARITY_RISING);
-    }
-  }
-}
-
-// Hàm xử lý SOS không nghẽn [cite: 16, 17, 18, 19]
-void handleSOS() {
-  if (HAL_GetTick() - lastSosMillis >= sosDelays[sosStep]) {
-    lastSosMillis = HAL_GetTick();
-    
-    // Bước chẵn là sáng (ON), lẻ là tắt (OFF)
-    if (sosStep % 2 == 0) {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET); // sáng hoàn toàn
-    } else {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET); // tắt hoàn toàn
-    }
-
-    sosStep++;
-    if (sosStep >= 18) { // Lặp lại chu kỳ [cite: 19, 20]
-      sosStep = 0;
-    }
-  }
+  RC_Input_CaptureCallback(htim);
 }
 
 /* USER CODE END 0 */
@@ -232,102 +104,48 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  // Khởi động Timer xuất PWM cho servo
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
 
-  // Tắt đèn mặc định và đưa servo về 0 độ (tương ứng xung 500us)
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 500);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 500);
+  /* 1. Tắt đèn mặc định */
+  HAL_GPIO_WritePin(LIGHT_GPIO_PORT, LIGHT_GPIO_PIN, GPIO_PIN_RESET);
 
-  // Cấp xung trong 1 giây để servo có đủ thời gian quay về gốc
+  /* 2. Khởi tạo servo: bật PWM và về 90° */
+  Servo_Init();
+
+  /* 3. Cấp xung 1 giây để servo ổn định về vị trí gốc */
   HAL_Delay(1000);
 
-  // Khởi tạo lastPulseTime SAU delay để tránh timeout kích hoạt ngay lập tức
-  // (nếu để = 0, điều kiện HAL_GetTick() - 0 > 50 đúng ngay, gây reset sai)
-  uint32_t now = HAL_GetTick();
-  lastPulseTime     = now;
-  lastPulseTime_ch2 = now;
-  lastPulseTime_ch3 = now;
+  /* 4. Khởi tạo RC Input (ghi lastPulseTime = now sau delay, tránh timeout sớm) */
+  RC_Input_Init();
 
-  // Sau đó mới khởi động Timer ngắt Input Capture
+  /* 5. Khởi động Input Capture ngắt */
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // ==============================================================
-    // CHẾ ĐỘ DEMO – Gọi hàm biểu diễn, không phụ thuộc tín hiệu ngõ vào.
-    // Khi muốn quay lại chế độ điều khiển bình thường, comment dòng
-    // này và bỏ comment khối điều khiển phía dưới.
-    Demo_Performance();
+    /* === CHẾ ĐỘ DEMO (bỏ comment dòng dưới để chạy demo tự động) === */
+    // Demo_Performance();
 
-    /* ------ KHỐI ĐIỀU KHIỂN BÌNH THƯỜNG (tạm comment để test demo) ------
+    /* === CHẾ ĐỘ ĐIỀU KHIỂN BÌNH THƯỜNG ================================ */
 
-    // Kiểm tra timeout: nếu không có xung trong 50ms thì reset về 0
-    if (HAL_GetTick() - lastPulseTime > 50) {
-      __disable_irq();
-      sharedPulseWidth = 0;
-      __enable_irq();
-    }
-    if (HAL_GetTick() - lastPulseTime_ch2 > 50) {
-      __disable_irq();
-      sharedPulseWidth_ch2 = 0;
-      __enable_irq();
-    }
-    if (HAL_GetTick() - lastPulseTime_ch3 > 50) {
-      __disable_irq();
-      sharedPulseWidth_ch3 = 0;
-      __enable_irq();
-    }
+    /* 1. Cập nhật timeout, reset pulse nếu mất tín hiệu */
+    RC_Input_Update();
 
-    // Truy xuất an toàn giá trị xung [cite: 10]
-    __disable_irq();
-    uint32_t currentPulse     = sharedPulseWidth;
-    uint32_t currentPulse_ch2 = sharedPulseWidth_ch2;
-    uint32_t currentPulse_ch3 = sharedPulseWidth_ch3;
-    __enable_irq();
+    /* 2. Đọc giá trị xung an toàn từ ISR */
+    uint32_t ch1 = RC_Input_GetCh1();
+    uint32_t ch2 = RC_Input_GetCh2();
+    uint32_t ch3 = RC_Input_GetCh3();
 
-    // Xuất xung ra PWM cho servo CH2 (ánh xạ 1000-2000us sang 500-2500us)
-    if (currentPulse_ch2 > 0) {
-      int32_t outPWM2 = ((int32_t)currentPulse_ch2 - 1000) * 2 + 500;
-      if (outPWM2 < 500)  outPWM2 = 500;
-      if (outPWM2 > 2500) outPWM2 = 2500;
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)outPWM2);
-    } else {
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-    }
+    /* 3. Cập nhật vị trí servo */
+    Servo_Update(ch2, ch3);
 
-    // Xuất xung ra PWM cho servo CH3 (ánh xạ 1000-2000us sang 500-2500us)
-    if (currentPulse_ch3 > 0) {
-      int32_t outPWM3 = ((int32_t)currentPulse_ch3 - 1000) * 2 + 500;
-      if (outPWM3 < 500)  outPWM3 = 500;
-      if (outPWM3 > 2500) outPWM3 = 2500;
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, (uint32_t)outPWM3);
-    } else {
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
-    }
-
-    // 1. Mức cao nhất (>1750us): Chế độ SOS [cite: 11]
-    if (currentPulse > 1750) {
-      handleSOS();
-    }
-    // 2. Mức thấp nhất (1000us – 1250us): Bật sáng (ON)
-    else if (currentPulse >= 1000 && currentPulse < 1250) {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
-      sosStep = 0;
-    }
-    // 3. Mức giữa hoặc mất tín hiệu: Tắt (OFF) [cite: 14]
-    else {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-      sosStep = 0;
-    }
-    ---------------------------------------------------------------------- */
+    /* 4. Cập nhật trạng thái đèn */
+    Lighting_Update(ch1);
 
     /* USER CODE END WHILE */
 
