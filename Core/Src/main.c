@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "demo_performance.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -73,7 +73,7 @@ uint32_t lastSosMillis = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+/* Demo_Performance() được khai báo trong demo_performance.h */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -196,6 +196,7 @@ void handleSOS() {
     }
   }
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -260,11 +261,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // HAL_Delay(1000);
-    // printf("Test 1 \n");
-    // HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+    // ==============================================================
+    // CHẾ ĐỘ DEMO – Gọi hàm biểu diễn, không phụ thuộc tín hiệu ngõ vào.
+    // Khi muốn quay lại chế độ điều khiển bình thường, comment dòng
+    // này và bỏ comment khối điều khiển phía dưới.
+    Demo_Performance();
 
-    // printf("SharedPulseWidth: %d \n", sharedPulseWidth);
+    /* ------ KHỐI ĐIỀU KHIỂN BÌNH THƯỜNG (tạm comment để test demo) ------
 
     // Kiểm tra timeout: nếu không có xung trong 50ms thì reset về 0
     if (HAL_GetTick() - lastPulseTime > 50) {
@@ -284,49 +287,48 @@ int main(void)
     }
 
     // Truy xuất an toàn giá trị xung [cite: 10]
-    __disable_irq(); // Tương đương noInterrupts()
-    uint32_t currentPulse = sharedPulseWidth;
+    __disable_irq();
+    uint32_t currentPulse     = sharedPulseWidth;
     uint32_t currentPulse_ch2 = sharedPulseWidth_ch2;
     uint32_t currentPulse_ch3 = sharedPulseWidth_ch3;
-    __enable_irq();  // Tương đương interrupts()
+    __enable_irq();
 
     // Xuất xung ra PWM cho servo CH2 (ánh xạ 1000-2000us sang 500-2500us)
     if (currentPulse_ch2 > 0) {
       int32_t outPWM2 = ((int32_t)currentPulse_ch2 - 1000) * 2 + 500;
-      if (outPWM2 < 500) outPWM2 = 500;   // Giới hạn dưới 500us (0 độ)
-      if (outPWM2 > 2500) outPWM2 = 2500; // Giới hạn trên 2500us (180 độ)
+      if (outPWM2 < 500)  outPWM2 = 500;
+      if (outPWM2 > 2500) outPWM2 = 2500;
       __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (uint32_t)outPWM2);
     } else {
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0); // Mất tín hiệu, tắt PWM
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
     }
 
     // Xuất xung ra PWM cho servo CH3 (ánh xạ 1000-2000us sang 500-2500us)
     if (currentPulse_ch3 > 0) {
       int32_t outPWM3 = ((int32_t)currentPulse_ch3 - 1000) * 2 + 500;
-      if (outPWM3 < 500) outPWM3 = 500;   // Giới hạn dưới 500us (0 độ)
-      if (outPWM3 > 2500) outPWM3 = 2500; // Giới hạn trên 2500us (180 độ)
+      if (outPWM3 < 500)  outPWM3 = 500;
+      if (outPWM3 > 2500) outPWM3 = 2500;
       __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, (uint32_t)outPWM3);
     } else {
-      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0); // Mất tín hiệu, tắt PWM
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0);
     }
 
     // 1. Mức cao nhất (>1750us): Chế độ SOS [cite: 11]
     if (currentPulse > 1750) {
-      // printf("SOS \n");
       handleSOS();
     }
-    // 2. Mức thấp nhất (1000us - 1250us): Bật sáng (ON)
+    // 2. Mức thấp nhất (1000us – 1250us): Bật sáng (ON)
     else if (currentPulse >= 1000 && currentPulse < 1250) {
-      // printf("Lighting ON \n");
       HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
-      sosStep = 0; 
+      sosStep = 0;
     }
     // 3. Mức giữa hoặc mất tín hiệu: Tắt (OFF) [cite: 14]
     else {
-      // printf("Lighting OFF \n");
       HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-      sosStep = 0; 
+      sosStep = 0;
     }
+    ---------------------------------------------------------------------- */
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
