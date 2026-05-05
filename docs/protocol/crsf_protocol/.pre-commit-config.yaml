@@ -1,0 +1,23 @@
+# Note: Remember to update tools/precheck.Dockerfile if more hooks are added
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+    - id: check-yaml
+    - id: check-illegal-windows-names
+    - id: check-merge-conflict
+    - id: end-of-file-fixer
+    - id: mixed-line-ending
+      args: ['-f=lf']
+    - id: trailing-whitespace
+- repo: https://github.com/codespell-project/codespell
+  rev: v2.3.0
+  hooks:
+    - id: codespell
+- repo: https://github.com/hukkin/mdformat/
+  rev: 0.7.19
+  hooks:
+    - id: mdformat
+    # Optional plugsins
+      additional_dependencies:
+      - mdformat-gfm  # GitHub Flavored Markdown
