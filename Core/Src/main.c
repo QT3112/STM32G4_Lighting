@@ -18,7 +18,9 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "tim.h"
+#include "usart.h"
 #include "usb_device.h"
 #include "gpio.h"
 
@@ -29,6 +31,7 @@
 #include "servo_control.h"
 #include "lighting_control.h"
 #include "mode_manager.h"
+#include "crsf.h"           /* Chế độ nhận tín hiệu CRSF qua UART3 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -101,9 +104,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USB_Device_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* 1. Tắt đèn mặc định */
@@ -118,10 +123,15 @@ int main(void)
   /* 4. Khởi tạo RC Input (ghi lastPulseTime = now sau delay, tránh timeout sớm) */
   RC_Input_Init();
 
-  /* 5. Khởi tạo bộ quản lý chế độ (mặc định: NORMAL) */
+  /* 5. Khởi tạo CRSF Input (DMA circular Rx trên USART3 @ 420000 baud)
+        Nếu bộ thu CRSF không được cắm, module vẫn hoạt động bình thường,
+        CRSF_Input_IsConnected() chỉ trả về 0 → chương trình tự dùng PWM. */
+  CRSF_Input_Init();
+
+  /* 6. Khởi tạo bộ quản lý chế độ (mặc định: NORMAL) */
   Mode_Init();
 
-  /* 6. Khởi động Input Capture ngắt */
+  /* 7. Khởi động Input Capture ngắt (chế độ PWM – luôn hoạt động) */
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
@@ -132,29 +142,54 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* 1. Cập nhật timeout, reset pulse nếu mất tín hiệu */
+    /* 1. Cập nhật timeout PWM và parse frame CRSF mới từ DMA buffer */
     RC_Input_Update();
+    CRSF_Input_Update();
 
-    /* 2. Đọc giá trị xung an toàn từ ISR */
-    uint32_t ch1 = RC_Input_GetCh1();
-    uint32_t ch2 = RC_Input_GetCh2();
-    uint32_t ch3 = RC_Input_GetCh3();
+    /* 2. Chọn nguồn tín hiệu điều khiển:
+     *      - Ưu tiên CRSF nếu bộ thu CRSF đang kết nối (cắm cụm dây CRSF)
+     *      - Nếu không → dùng PWM thông thường (cắm cụm dây PWM)
+     *
+     * Ánh xạ kênh (Channel Mapping):
+     *   CH1 → Servo 1
+     *   CH2 → Servo 2
+     *   CH6 → Đèn / Lighting (công tắc trên tay cầm) */
+    uint32_t ch_servo1, ch_servo2, ch_light;
 
-    /* 3. Cập nhật bộ phát hiện cử chỉ toggle chế độ
-          (luôn chạy dù đang ở chế độ nào) */
-    Mode_Update(ch1);
+    if (CRSF_Input_IsConnected())
+    {
+      /* CHẾ ĐỘ CRSF: đọc kênh từ bộ thu CRSF qua UART3 */
+      ch_servo1 = CRSF_Input_GetCh1();  /* CH1 → Servo 1 */
+      ch_servo2 = CRSF_Input_GetCh2();  /* CH2 → Servo 2 */
+      ch_light  = CRSF_Input_GetCh6();  /* CH6 → Đèn     */
+    }
+    else
+    {
+      /* CHẾ ĐỘ PWM: đọc kênh từ TIM2 Input Capture (RC Receiver truyền thống)
+       * PWM chỉ có 3 kênh vật lý (PA0/PA1/PA2):
+       *   TIM2 CH1 (PA0) → Servo 1
+       *   TIM2 CH2 (PA1) → Servo 2
+       *   TIM2 CH3 (PA2) → Đèn     */
+      ch_servo1 = RC_Input_GetCh1();    /* PA0 → Servo 1 */
+      ch_servo2 = RC_Input_GetCh2();    /* PA1 → Servo 2 */
+      ch_light  = RC_Input_GetCh3();    /* PA2 → Đèn     */
+    }
 
-    /* 4. Điều phối theo chế độ hiện tại */
+    /* 3. Cập nhật bộ phát hiện cử chỉ toggle chế độ NORMAL/DEMO
+          (luôn chạy dù đang dùng nguồn tín hiệu nào) */
+    Mode_Update(ch_light);
+
+    /* 4. Điều phối theo chế độ hoạt động */
     if (Mode_Get() == APP_MODE_DEMO)
     {
-      /* CHẾ ĐỘ DEMO: đèn do Demo_Performance() điều khiển */
+      /* CHẾ ĐỘ DEMO: đèn do Demo_Performance() điều khiển tự động */
       Demo_Performance();
     }
     else
     {
-      /* CHẾ ĐỘ NORMAL: servo + đèn theo tín hiệu RC */
-      Servo_Update(ch2, ch3);
-      Lighting_Update(ch1);
+      /* CHẾ ĐỘ NORMAL: servo + đèn theo tín hiệu điều khiển (PWM hoặc CRSF) */
+      Servo_Update(ch_servo1, ch_servo2);
+      Lighting_Update(ch_light);
     }
 
     /* USER CODE END WHILE */

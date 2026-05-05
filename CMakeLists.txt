@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/servo_control.c
     Core/Src/lighting_control.c
     Core/Src/mode_manager.c
+    Core/Src/crsf.c             # CRSF protocol parser + DMA input module
 )
 
 # Add include paths

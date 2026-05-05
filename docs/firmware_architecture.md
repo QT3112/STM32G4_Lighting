@@ -1,11 +1,11 @@
 # STM32G4_Lighting — Firmware Architecture Document
 
-**Document Version:** 1.0  
-**MCU:** STM32G431CBUx (Cortex-M4, 170 MHz, 128 KB Flash, 32 KB RAM)  
-**Package:** UFQFPN48  
-**Toolchain:** STM32CubeMX + CMake + ARM GCC  
-**HAL:** STM32Cube FW_G4 V1.6.2  
-**Date:** 2026-04-25
+**Document Version:** 2.0
+**MCU:** STM32G431CBUx (Cortex-M4, 170 MHz, 128 KB Flash, 32 KB RAM)
+**Package:** UFQFPN48
+**Toolchain:** STM32CubeMX + CMake + ARM GCC
+**HAL:** STM32Cube FW_G4 V1.6.2
+**Date:** 2026-05-05
 
 ---
 
@@ -15,38 +15,48 @@
 2. [Hardware Platform](#2-hardware-platform)
 3. [Software Stack](#3-software-stack)
 4. [Module Architecture](#4-module-architecture)
-5. [Peripheral Configuration](#5-peripheral-configuration)
-6. [Signal Processing Pipeline](#6-signal-processing-pipeline)
-7. [Lighting Control State Machine](#7-lighting-control-state-machine)
-8. [Servo Control Logic](#8-servo-control-logic)
-9. [Interrupt & Execution Model](#9-interrupt--execution-model)
-10. [Data Flow Diagram](#10-data-flow-diagram)
-11. [Pin Assignment Table](#11-pin-assignment-table)
-12. [Clock Tree](#12-clock-tree)
-13. [Memory Layout](#13-memory-layout)
-14. [Known Limitations & Future Work](#14-known-limitations--future-work)
+5. [Dual-Mode Input Architecture](#5-dual-mode-input-architecture)
+6. [Peripheral Configuration](#6-peripheral-configuration)
+7. [CRSF Protocol Implementation](#7-crsf-protocol-implementation)
+8. [Signal Processing Pipeline](#8-signal-processing-pipeline)
+9. [Lighting Control State Machine](#9-lighting-control-state-machine)
+10. [Servo Control Logic](#10-servo-control-logic)
+11. [Interrupt & Execution Model](#11-interrupt--execution-model)
+12. [Data Flow Diagram](#12-data-flow-diagram)
+13. [Pin Assignment Table](#13-pin-assignment-table)
+14. [Clock Tree](#14-clock-tree)
+15. [Memory Layout](#15-memory-layout)
+16. [Known Limitations & Future Work](#16-known-limitations--future-work)
 
 ---
 
 ## 1. System Overview
 
-The **STM32G4_Lighting** firmware is designed to run on an STM32G431CBUx microcontroller acting as a **signal router and lighting controller** in an RC (Radio-Control) vehicle or aerial platform system. Its core responsibilities are:
-
-- **Receive** up to three independent PWM signals from an RC receiver (CH1, CH2, CH3) via hardware Input Capture (TIM2).
-- **Route and scale** servo PWM outputs back to two servo motors via TIM3 CH2 and CH3.
-- **Decode CH1 pulse width** to drive a LED/lighting system with three distinct modes: OFF, ON, and SOS distress pattern.
-- **Protect** against signal loss by applying a 50 ms timeout — outputs are zeroed on loss of signal.
-- **Validate** every captured pulse against the standard RC PWM window (800 – 2200 µs) to reject electrical noise.
-- Provide a **USB CDC (Virtual COM Port)** interface for optional debug output.
+The **STM32G4_Lighting** firmware runs on an STM32G431CBUx acting as a **signal router and lighting controller**. A key feature introduced in v2.0 is **Dual-Mode Input**: the device accepts control signals from either a classic RC PWM receiver **or** a CRSF-compatible receiver (e.g. Radiomaster/TBS) — selected automatically by hardware cable connection, with no firmware reconfiguration required.
 
 ```mermaid
 graph TD
-    RC[RC Receiver] -->|3x PWM signals| STM["STM32G431CBUx\n(Firmware)"]
-    STM -->|Servo PWM CH2| S1[Servo Motor 1]
-    STM -->|Servo PWM CH3| S2[Servo Motor 2]
-    STM -->|GPIO ON/OFF| LED[LED / Lighting]
-    STM <-->|USB CDC Virtual COM| PC[Debug Host PC]
+    subgraph "Cụm dây PWM (Chế độ 1)"
+        RX_PWM[RC Receiver\nPWM truyền thống] -->|CH1 CH2 CH3\nPA0 PA1 PA2| TIM2[TIM2 Input Capture]
+    end
+
+    subgraph "Cụm dây CRSF (Chế độ 2)"
+        RX_CRSF[CRSF Receiver\nRadiomaster / TBS / ELRS] -->|UART TX → PB11\n420000 baud 8N1| USART3[USART3 + DMA1]
+    end
+
+    TIM2 -->|sharedPulseWidth| MUX{Bộ chọn\nnguồn tín hiệu\nauto-detect}
+    USART3 -->|CRSF_IsConnected| MUX
+
+    MUX -->|ch1 ch2 ch3| CTRL[Lighting_Update\nServo_Update\nMode_Update]
+    CTRL -->|GPIO PA6| LED[LED / Đèn chiếu sáng]
+    CTRL -->|TIM3 CH2/CH3| SRV[Servo 1 / Servo 2]
+    CTRL -->|USB CDC| DBG[Debug Host PC]
 ```
+
+**Nguyên tắc auto-detect:**
+- Cả hai đường UART3 (DMA) và TIM2 (Capture) luôn hoạt động đồng thời.
+- Trong `main` loop: nếu `CRSF_Input_IsConnected() == 1` → dùng kênh CRSF; ngược lại → dùng `RC_Input_GetChX()` từ PWM.
+- Người dùng chỉ cần cắm đúng cụm dây tương ứng, firmware tự chuyển nguồn.
 
 ---
 
@@ -68,13 +78,13 @@ graph TD
 
 | Peripheral | Mode | Purpose |
 |---|---|---|
-| TIM2 | Input Capture (3 ch) | Read PWM signals from RC receiver |
-| TIM3 | PWM Output (2 ch) | Drive servo motors |
-| GPIO PA6 | Output Push-Pull | LED lighting control |
-| GPIO PC6 | Output Push-Pull | Secondary LED / reserved output |
+| TIM2 | Input Capture (3 ch) | Đọc tín hiệu PWM từ RC receiver (chế độ PWM) |
+| TIM3 | PWM Output (2 ch) | Điều khiển servo motor |
+| USART3 | UART RX @ 420 kbaud | Nhận dữ liệu CRSF từ bộ thu RF (chế độ CRSF) |
+| DMA1 Ch1 | Circular, Periph→Mem | Nhận USART3 RX không cần ngắt |
+| GPIO PA6 | Output Push-Pull | Điều khiển đèn LED |
 | USB FS | CDC Device | Debug Virtual COM Port |
-| SysTick | System Timer | HAL tick, `HAL_GetTick()`, timeout tracking |
-| NVIC | Interrupt Controller | TIM2 IRQ priority 0 (highest), USB LP |
+| SysTick | System Timer | `HAL_GetTick()`, timeout tracking |
 
 ---
 
@@ -82,29 +92,35 @@ graph TD
 
 ```mermaid
 graph TD
-    APP["Application Layer\n(main.c — control logic,\nSOS sequencer, signal loss detection)"]
+    APP["Application Layer\n(main.c — dual-mode input select,\ncontrol dispatch, mode management)"]
+    CRSF_MOD["crsf.c\nCRSF Parser + DMA Input Module"]
+    RC_MOD["rc_input.c\nPWM Input Capture Module"]
     HAL["STM32 HAL Layer\n(STM32Cube FW_G4 V1.6.2)"]
-    BSP["BSP / Peripheral Init\n(tim.c, gpio.c, stm32g4xx_hal_msp.c)"]
-    ISR["Interrupt Service Routines\n(stm32g4xx_it.c — TIM2 IRQ, USB IRQ)"]
+    BSP["BSP / Peripheral Init\n(tim.c, gpio.c, usart.c, dma.c)"]
+    ISR["Interrupt Service Routines\n(stm32g4xx_it.c)"]
     HW["Hardware\n(STM32G431CBUx Silicon)"]
 
+    APP --> CRSF_MOD
+    APP --> RC_MOD
     APP --> HAL
-    APP --> ISR
+    CRSF_MOD --> HAL
+    RC_MOD --> HAL
     BSP --> HAL
-    HAL --> HW
     ISR --> HAL
+    HAL --> HW
 ```
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| **Application** | `Core/Src/main.c` | Control loop, lighting FSM, servo mapping, timeout detection |
-| **ISR / Callbacks** | `Core/Src/main.c` (callback), `Core/Src/stm32g4xx_it.c` | PWM edge capture, IRQ dispatch |
-| **Peripheral Init** | `Core/Src/tim.c`, `Core/Src/gpio.c` | TIM2/TIM3 setup, GPIO config |
-| **HAL MSP** | `Core/Src/stm32g4xx_hal_msp.c` | Low-level peripheral clock / NVIC setup |
-| **USB Middleware** | `USB_Device/`, `Middlewares/` | CDC VCP driver stack |
-| **Startup / Runtime** | `startup_stm32g431xx.s`, `Core/Src/syscalls.c`, `sysmem.c` | Reset handler, heap, newlib stubs |
-| **System** | `Core/Src/system_stm32g4xx.c` | SystemCoreClock config |
-| **Build** | `CMakeLists.txt`, `cmake/stm32cubemx/` | CMake + ARM GCC toolchain |
+| **Application** | `main.c` | Dual-mode input select, FSM dispatch, mode management |
+| **CRSF Input** | `crsf.c / crsf.h` | DMA buffer management, CRSF frame parser, high-level API |
+| **RC PWM Input** | `rc_input.c / rc_input.h` | TIM2 IC callback, pulse width calculation, timeout |
+| **Servo Control** | `servo_control.c / .h` | Linear scaling, TIM3 CCR output |
+| **Lighting FSM** | `lighting_control.c / .h` | OFF / ON / SOS state machine |
+| **Mode Manager** | `mode_manager.c / .h` | NORMAL ↔ DEMO gesture detection |
+| **Demo** | `demo_performance.c / .h` | 7-step autonomous lighting sequence |
+| **Peripheral Init** | `tim.c`, `gpio.c`, `usart.c`, `dma.c` | CubeMX-generated HAL init |
+| **USB Middleware** | `USB_Device/`, `Middlewares/` | CDC VCP driver |
 
 ---
 
@@ -113,445 +129,383 @@ graph TD
 ```mermaid
 graph LR
     subgraph "Core/Inc"
+        crsfh[crsf.h]
+        rch[rc_input.h]
+        svh[servo_control.h]
+        lch[lighting_control.h]
+        mmh[mode_manager.h]
         mh[main.h]
-        th[tim.h]
-        gh[gpio.h]
-        ith[stm32g4xx_it.h]
     end
 
     subgraph "Core/Src"
-        mc[main.c\nControl Loop + Callbacks]
-        tc[tim.c\nTIM2 IC / TIM3 PWM Init]
-        gc[gpio.c\nGPIO Init]
-        ic[stm32g4xx_it.c\nIRQ Handlers]
-        msp[stm32g4xx_hal_msp.c\nMSP Init]
-        rc[retarget.c\nprintf → USB CDC]
-        sc[syscalls.c / sysmem.c\nNewlib Runtime]
-        sysc[system_stm32g4xx.c\nClock Init]
+        mc[main.c\nDual-mode dispatch]
+        crsfc[crsf.c\nParser + DMA Input]
+        rcc[rc_input.c\nTIM2 IC]
+        svc[servo_control.c]
+        lcc[lighting_control.c]
+        mmc[mode_manager.c]
+        tc[tim.c]
+        gc[gpio.c]
+        uc[usart.c + dma.c]
     end
 
-    subgraph "USB_Device"
-        usb[usb_device.c\nCDC Init]
-    end
-
-    mc --> tc
-    mc --> gc
-    mc --> usb
-    ic --> mc
-    msp --> tc
-    msp --> gc
-    rc --> usb
+    mc --> crsfc
+    mc --> rcc
+    mc --> svc
+    mc --> lcc
+    mc --> mmc
+    crsfc --> uc
+    rcc --> tc
 ```
-
-### Key Shared State (Volatile Global Variables)
-
-All variables below are `volatile` and shared between the ISR (`HAL_TIM_IC_CaptureCallback`) and the main loop. Access from the main loop is **always guarded by `__disable_irq()` / `__enable_irq()`**.
-
-| Variable | Type | Updated by | Read by | Description |
-|---|---|---|---|---|
-| `sharedPulseWidth` | `uint32_t` | TIM2 CH1 ISR | Main loop | Filtered pulse width of CH1 (µs) |
-| `sharedPulseWidth_ch2` | `uint32_t` | TIM2 CH2 ISR | Main loop | Filtered pulse width of CH2 (µs) |
-| `sharedPulseWidth_ch3` | `uint32_t` | TIM2 CH3 ISR | Main loop | Filtered pulse width of CH3 (µs) |
-| `lastPulseTime` | `uint32_t` | TIM2 CH1 ISR | Main loop | `HAL_GetTick()` of last valid CH1 pulse |
-| `lastPulseTime_ch2` | `uint32_t` | TIM2 CH2 ISR | Main loop | `HAL_GetTick()` of last valid CH2 pulse |
-| `lastPulseTime_ch3` | `uint32_t` | TIM2 CH3 ISR | Main loop | `HAL_GetTick()` of last valid CH3 pulse |
-| `capture1`, `capture1_ch2`, `capture1_ch3` | `uint32_t` | TIM2 ISR | TIM2 ISR | Rising-edge timestamp for each channel |
-| `isFirstCaptured` (×3) | `uint8_t` | TIM2 ISR | TIM2 ISR | Edge-polarity state machine flag per channel |
-| `sosStep` | `int` | Main loop | Main loop | Current step index in the SOS sequence (0–17) |
-| `lastSosMillis` | `uint32_t` | Main loop | Main loop | Timestamp of the last SOS step change |
 
 ---
 
-## 5. Peripheral Configuration
+## 5. Dual-Mode Input Architecture
 
-### 5.1 TIM2 — Input Capture (PWM Decoder)
+Đây là phần cốt lõi được bổ sung trong v2.0. Cả hai nguồn tín hiệu hoạt động song song và firmware tự chọn nguồn ưu tiên:
 
-TIM2 is configured as a **32-bit free-running counter** to measure the pulse width of incoming RC PWM signals.
+```mermaid
+flowchart TD
+    A([Main Loop Start]) --> B[RC_Input_Update\nTimeout check PWM]
+    B --> C[CRSF_Input_Update\nParse DMA buffer mới]
+    C --> D{CRSF_Input_IsConnected?}
+
+    D -->|Yes – cụm dây CRSF được cắm| E[ch1 = CRSF_Input_GetCh1\nch2 = CRSF_Input_GetCh2\nch3 = CRSF_Input_GetCh3]
+    D -->|No – cụm dây PWM được cắm| F[ch1 = RC_Input_GetCh1\nch2 = RC_Input_GetCh2\nch3 = RC_Input_GetCh3]
+
+    E --> G[Mode_Update ch1]
+    F --> G
+    G --> H{Mode_Get == DEMO?}
+    H -->|Yes| I[Demo_Performance]
+    H -->|No| J[Servo_Update ch2 ch3\nLighting_Update ch1]
+    I --> A
+    J --> A
+```
+
+### Điều kiện chuyển chế độ
+
+| Tình huống | Kết quả |
+|---|---|
+| Cắm cụm dây CRSF, bộ thu đang hoạt động | `CRSF_Input_IsConnected() == 1` → dùng CRSF |
+| Tháo cụm dây CRSF (hoặc tắt bộ thu) | Sau `CRSF_TIMEOUT_MS` = 300 ms → `is_connected = 0` → tự chuyển về PWM |
+| Chỉ cắm cụm dây PWM | CRSF không có packet → luôn dùng PWM |
+| Cắm đồng thời cả 2 | CRSF được ưu tiên khi có tín hiệu |
+
+---
+
+## 6. Peripheral Configuration
+
+### 6.1 TIM2 — Input Capture (PWM Decoder)
 
 | Parameter | Value | Calculation |
 |---|---|---|
-| Source Clock | APB1 Timer Clock = 170 MHz | |
-| Prescaler | 169 | Tick period = 170 MHz / (169+1) = **1 µs per tick** |
-| Period (ARR) | 0xFFFFFFFF (≈ 4294 s) | Effectively never overflows in practice |
-| Counter Mode | Up-counting | |
-| Channels | CH1 (PA0), CH2 (PA1), CH3 (PA2) | Input Capture from TI1/TI2/TI3 |
-| Input Pull | Pull-Down | Pins idle LOW when no signal present |
-| ICFilter | 0 (no hardware filter) | Software validation used instead |
-| IRQ Priority | 0 (highest) | Time-critical edge capture |
+| Source Clock | APB1 = 170 MHz | |
+| Prescaler | 169 | 170 MHz / 170 = **1 µs/tick** |
+| Period (ARR) | 0xFFFFFFFF | 32-bit, không tràn trong thực tế |
+| Channels | CH1 (PA0), CH2 (PA1), CH3 (PA2) | Input Capture |
+| IRQ Priority | 0 (highest) | Time-critical |
 
-### 5.2 TIM3 — PWM Output (Servo Driver)
-
-TIM3 generates standard RC servo PWM at 50 Hz with 1 µs resolution.
-
-| Parameter | Value | Calculation |
-|---|---|---|
-| Source Clock | APB1 Timer Clock = 170 MHz | |
-| Prescaler | 169 | Tick period = **1 µs per tick** |
-| Period (ARR) | 19999 | PWM period = (19999+1) µs = **20 ms = 50 Hz** |
-| Channels | CH2 (PA4), CH3 (PB0) | PWM Generation |
-| Output Mode | PWM1 (active HIGH) | |
-| Default Pulse | 500 (µs) | Servo resting / center position |
-
-### 5.3 GPIO
-
-| Pin | Port | Mode | Purpose |
-|---|---|---|---|
-| PA0 | GPIOA | AF (TIM2_CH1) | RC Receiver PWM input — CH1 (Lighting control) |
-| PA1 | GPIOA | AF (TIM2_CH2) | RC Receiver PWM input — CH2 (Servo 1) |
-| PA2 | GPIOA | AF (TIM2_CH3) | RC Receiver PWM input — CH3 (Servo 2) |
-| PA4 | GPIOA | AF (TIM3_CH2) | Servo 1 PWM output |
-| PA6 | GPIOA | Output Push-Pull | LED / Lighting control |
-| PB0 | GPIOB | AF (TIM3_CH3) | Servo 2 PWM output |
-| PA11 | GPIOA | AF (USB_DM) | USB D- |
-| PA12 | GPIOA | AF (USB_DP) | USB D+ |
-| PC6 | GPIOC | Output Push-Pull | Secondary LED output (reserved) |
-
-### 5.4 USB — CDC Virtual COM Port
+### 6.2 TIM3 — PWM Output (Servo Driver)
 
 | Parameter | Value |
 |---|---|
-| Mode | Full-Speed Device (USB FS) |
-| Class | CDC (Communications Device Class) |
-| Sub-function | Virtual COM Port (VCP) |
-| Endpoint | Bulk IN/OUT + Interrupt IN |
-| Clock Source | HSI48 (48 MHz), trimmed by CRS |
-| Purpose | Debug `printf` output via `retarget.c` |
+| Prescaler | 169 → 1 µs/tick |
+| Period (ARR) | 19999 → 20 ms = 50 Hz |
+| Channels | CH2 (PA4), CH3 (PB0) |
+
+### 6.3 USART3 — CRSF Receiver
+
+| Parameter | Value | Ghi chú |
+|---|---|---|
+| Baud Rate | **420 000** | CRSF chuẩn 416 666, sai số < 1% |
+| Word Length | 8 bits | |
+| Parity | None | |
+| Stop Bits | 1 | |
+| Mode | RX (+ TX dự phòng telemetry) | |
+| DMA RX | DMA1_Ch1, **Circular** | Nhận liên tục, không cần ngắt |
+| Interrupt | USART3 global (tùy chọn) | Không bắt buộc khi dùng DMA polling |
+
+### 6.4 DMA1 — USART3_RX
+
+| Parameter | Value |
+|---|---|
+| Instance | DMA1_Channel1 |
+| Direction | Periph → Memory |
+| Mode | **Circular** |
+| Buffer size | 128 byte (`CRSF_DMA_BUF_SIZE`) |
+| Data width | Byte |
 
 ---
 
-## 6. Signal Processing Pipeline
+## 7. CRSF Protocol Implementation
 
-### 6.1 PWM Input Capture Algorithm (per channel)
+### 7.1 Cấu trúc Frame CRSF
 
-Each channel uses a **toggle-polarity edge-capture** technique to measure pulse width using a single capture register:
+```mermaid
+flowchart LR
+    S[Sync / Address\n1 byte\n0xC8 0xEA 0xEC 0xEE] ~~~
+    L[Frame Length\n1 byte\n= Type+Payload+CRC] ~~~
+    T[Type\n1 byte] ~~~
+    P[Payload\n0-60 bytes] ~~~
+    C[CRC8-DVB-S2\n1 byte]
+```
+
+**Frame types được hỗ trợ:**
+
+| Type | Hex | Payload | Mô tả |
+|---|---|---|---|
+| RC Channels | `0x16` | 22 bytes | 16 kênh × 11-bit (quan trọng nhất) |
+| Link Statistics | `0x14` | 10 bytes | RSSI, LQ, SNR, TX Power |
+| Battery Sensor | `0x08` | 8 bytes | Voltage, Current, Capacity, % |
+| Attitude | `0x1E` | 6 bytes | Pitch, Roll, Yaw (rad × 10000) |
+| Flight Mode | `0x21` | var | Null-terminated string |
+
+### 7.2 Giải mã RC Channels (0x16)
+
+16 kênh × 11 bit được đóng gói chặt trong 22 byte (little-endian bit stream):
+
+```
+CRSF raw range : 172 – 1811  (11-bit)
+Center (1500µs): 992
+Formula        : µs = (raw - 992) × 5/8 + 1500
+Output clamp   : [1000, 2000] µs
+```
+
+### 7.3 DMA Circular Buffer Polling
+
+```mermaid
+sequenceDiagram
+    participant DMA as DMA1 (Hardware)
+    participant BUF as s_dma_buf[128]
+    participant UPD as CRSF_Input_Update()
+    participant DATA as s_crsf_data
+
+    loop USART3 nhận byte liên tục
+        DMA->>BUF: Ghi byte vào vị trí write_pos (circular)
+    end
+
+    loop Main Loop (mỗi iteration)
+        UPD->>DMA: Đọc __HAL_DMA_GET_COUNTER → tính write_pos
+        UPD->>BUF: Copy đoạn [read_pos .. write_pos] mới
+        UPD->>DATA: CRSF_ParseFrame → cập nhật channels, is_connected
+        UPD->>DATA: CRSF_IsConnected → kiểm tra timeout
+    end
+```
+
+### 7.4 CRC-8/DVB-S2
+
+- Polynomial: `0xD5` (x⁷+x⁶+x⁴+x²+x⁰)
+- Init: `0x00`
+- Tính trên: `[Type] + [Payload]` (KHÔNG bao gồm Sync và Length)
+- Triển khai: lookup table 256 phần tử (`s_crc8_table[]`)
+
+---
+
+## 8. Signal Processing Pipeline
+
+### 8.1 PWM Input Capture (TIM2)
+
+Mỗi kênh dùng kỹ thuật đảo cực polarity:
 
 ```mermaid
 sequenceDiagram
     participant RC as RC Receiver
     participant HW as TIM2 Hardware
     participant ISR as TIM2 ISR Callback
-    participant Globals as Shared Globals
+    participant Shared as rc_input.c globals
 
     RC->>HW: Rising edge on PAx
-    HW->>ISR: TIM2_IRQHandler → HAL_TIM_IC_CaptureCallback
-    ISR->>ISR: isFirstCaptured == 0 ?
-    ISR->>HW: Read CCR → store in capture1_chN
-    ISR->>HW: Switch polarity to FALLING
-    ISR->>ISR: isFirstCaptured = 1
-
+    HW->>ISR: HAL_TIM_IC_CaptureCallback
+    ISR->>ISR: s_firstEdge == 0 ?
+    ISR->>Shared: Lưu capture1, set polarity FALLING
     RC->>HW: Falling edge on PAx
-    HW->>ISR: TIM2_IRQHandler → HAL_TIM_IC_CaptureCallback
-    ISR->>ISR: isFirstCaptured == 1 ?
-    ISR->>HW: Read CCR → capture2
-    ISR->>ISR: pulse = capture2 - capture1 (overflow safe)
-    ISR->>ISR: 800 ≤ pulse ≤ 2200 ? (noise filter)
-    ISR->>Globals: sharedPulseWidth_chN = pulse
-    ISR->>Globals: lastPulseTime_chN = HAL_GetTick()
-    ISR->>HW: Switch polarity back to RISING
-    ISR->>ISR: isFirstCaptured = 0
+    HW->>ISR: HAL_TIM_IC_CaptureCallback
+    ISR->>ISR: Tính pulse = fall - rise (overflow-safe)
+    ISR->>ISR: 800 ≤ pulse ≤ 2200 µs ? (noise filter)
+    ISR->>Shared: s_pulseWidth_chN = pulse\ns_lastPulseTime = HAL_GetTick()
+    ISR->>HW: Set polarity RISING
 ```
 
-#### Overflow Handling
+### 8.2 Signal Loss Detection
 
-```c
-if (capture2 > capture1) {
-    pulse = capture2 - capture1;
-} else {
-    pulse = (0xFFFFFFFF - capture1) + capture2 + 1;  // 32-bit rollover
-}
-```
+- **PWM:** `RC_Input_Update()` trong main loop, timeout = **200 ms** (`RC_TIMEOUT_MS`)
+- **CRSF:** `CRSF_IsConnected()` trong `CRSF_Input_Update()`, timeout = **300 ms** (`CRSF_TIMEOUT_MS`)
 
-#### Noise Rejection Filter
-
-Only pulses in the **standard RC PWM range (800 – 2200 µs)** are accepted. Glitches outside this window are silently discarded, keeping the last known good value.
-
-### 6.2 Signal Loss Detection (50 ms Timeout)
-
-The main loop checks for signal freshness on every iteration:
-
-```c
-if (HAL_GetTick() - lastPulseTime > 50) {
-    sharedPulseWidth = 0;  // RC signal lost → safe fallback
-}
-```
-
-This drives the servo outputs to 0 (disabled) and the LED to OFF on loss of signal, preventing uncontrolled behaviour.
+Khi mất tín hiệu từ cả 2 nguồn → ch1=ch2=ch3=0 → servo về trung tâm, đèn tắt (failsafe).
 
 ---
 
-## 7. Lighting Control State Machine
+## 9. Lighting Control State Machine
 
-CH1 pulse width (`sharedPulseWidth`) determines the LED operating mode. The FSM runs in the main loop.
+CH1 (µs) → quyết định trạng thái đèn (áp dụng cho cả 2 chế độ input):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> INIT : Power-on
+    [*] --> OFF : Power-on
 
-    INIT --> OFF : HAL_Delay(1000)\ninitialize lastPulseTime
+    OFF --> SOS : ch1 > 1750 µs
+    OFF --> ON  : 750 ≤ ch1 < 1250 µs
+    OFF --> OFF : ch1 = 0 (lost) hoặc trung gian
 
-    OFF --> SOS : pulse > 1750 µs
-    OFF --> ON : 1000 µs ≤ pulse < 1250 µs
-    OFF --> OFF : pulse = 0 (signal lost)\nor 1250 µs ≤ pulse ≤ 1750 µs
+    ON --> SOS  : ch1 > 1750 µs
+    ON --> OFF  : ch1 = 0 hoặc trung gian
+    ON --> ON   : 750 ≤ ch1 < 1250 µs
 
-    ON --> SOS : pulse > 1750 µs
-    ON --> OFF : pulse = 0 or mid-range
-    ON --> ON : 1000 µs ≤ pulse < 1250 µs
-
-    SOS --> ON : 1000 µs ≤ pulse < 1250 µs
-    SOS --> OFF : pulse = 0 or mid-range
-    SOS --> SOS : pulse > 1750 µs → cycle SOS steps
+    SOS --> ON  : 750 ≤ ch1 < 1250 µs
+    SOS --> OFF : ch1 = 0 hoặc trung gian
+    SOS --> SOS : ch1 > 1750 µs (cycle)
 ```
 
-### Channel 1 Pulse-Width Mapping
-
-| Pulse Width (µs) | State | LED Action |
+| Pulse Width (µs) | Trạng thái | Hành động |
 |---|---|---|
-| 0 (timeout / no signal) | **OFF** | `GPIO_PIN_RESET` |
-| 800 – 999 | **OFF** | `GPIO_PIN_RESET` |
-| 1000 – 1249 | **ON** | `GPIO_PIN_SET` |
-| 1250 – 1750 | **OFF** | `GPIO_PIN_RESET` |
-| > 1750 | **SOS** | Non-blocking SOS pattern |
-
-### SOS Pattern Sequencer
-
-The SOS pattern is driven non-blocking via `HAL_GetTick()` comparison — **no `HAL_Delay()` is used**, ensuring the main loop remains responsive.
-
-```mermaid
-sequenceDiagram
-    participant Loop as Main Loop
-    participant SOS as handleSOS()
-    participant GPIO as PA6 (LED)
-
-    loop Every main loop iteration (when pulse > 1750)
-        Loop->>SOS: call handleSOS()
-        SOS->>SOS: HAL_GetTick() - lastSosMillis >= sosDelays[sosStep] ?
-        alt Delay elapsed
-            SOS->>GPIO: sosStep%2==0 → PIN_SET (ON)
-            SOS->>GPIO: sosStep%2==1 → PIN_RESET (OFF)
-            SOS->>SOS: sosStep++ (wrap at 18)
-            SOS->>SOS: lastSosMillis = HAL_GetTick()
-        else Still waiting
-            SOS-->>Loop: return (no action)
-        end
-    end
-```
-
-#### SOS Timing Table
-
-| Step | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| State | ON | OFF | ON | OFF | ON | OFF | ON | OFF | ON | OFF | ON | OFF | ON | OFF | ON | OFF | ON | OFF |
-| Delay (ms) | 150 | 150 | 150 | 150 | 150 | 450 | 450 | 150 | 450 | 150 | 450 | 450 | 150 | 150 | 150 | 150 | 150 | 1050 |
-| Morse | · | · | · | · | · | | — | | — | | — | | · | | · | | · | Pause |
-
-> **Morse code:** `.` = 150 ms ON, `—` = 450 ms ON, separators are OFF gaps. Repeats continously.
+| 0 (timeout) | OFF | GPIO_PIN_RESET |
+| 750 – 1249 | ON | GPIO_PIN_SET |
+| 1250 – 1750 | OFF | GPIO_PIN_RESET |
+| > 1750 | SOS | Non-blocking SOS Morse |
 
 ---
 
-## 8. Servo Control Logic
+## 10. Servo Control Logic
 
-Channels CH2 and CH3 are passed through to servo outputs with **linear scaling** from the standard RC range (1000–2000 µs) to the wider servo range (500–2500 µs), giving full mechanical range.
-
-```mermaid
-graph LR
-    A["Input\nsharedPulseWidth_chN\n(1000–2000 µs)"] -->|"Linear Map\n(x-1000)*2 + 500"| B["Output PWM\n(500–2500 µs)"]
-    B -->|Clamp 500–2500| C["TIM3 CCR\n__HAL_TIM_SET_COMPARE"]
-    D["Signal Lost\npulse == 0"] -->|"CCR = 0"| C
-```
-
-### Scaling Formula
+CH2, CH3 → TIM3 CCR (linear mapping):
 
 ```
 outPWM = (inputPulse - 1000) × 2 + 500
+Clamp: [500, 2500] µs
+Signal lost (=0): CCR = 0 (servo unpowered)
 ```
 
-| Input (µs) | Calculated (µs) | Clamped Output (µs) | Servo Position |
-|---|---|---|---|
-| 1000 | 500 | 500 | 0° (full CCW) |
-| 1500 | 1500 | 1500 | 90° (center) |
-| 2000 | 2500 | 2500 | 180° (full CW) |
-| 0 (lost) | — | 0 (PWM disabled) | Limp / unpowered |
+| Input (µs) | Output (µs) | Servo Position |
+|---|---|---|
+| 1000 | 500 | 0° |
+| 1500 | 1500 | 90° |
+| 2000 | 2500 | 180° |
 
 ---
 
-## 9. Interrupt & Execution Model
+## 11. Interrupt & Execution Model
 
-The firmware uses a **foreground/background** (superloop + ISR) execution model — no RTOS.
+Mô hình foreground/background (superloop + ISR), không RTOS:
 
 ```mermaid
 graph TD
-    subgraph "Background — ISR Context (highest priority)"
-        TICK["SysTick IRQ\n1 ms tick\nHAL_IncTick()"]
-        TIM2IRQ["TIM2_IRQHandler\n→ HAL_TIM_IRQHandler\n→ HAL_TIM_IC_CaptureCallback\nEdge capture + noise filter\nWrite: sharedPulseWidth_chN\nWrite: lastPulseTime_chN"]
-        USBIRQ["USB_LP_IRQHandler\nHAL_PCD_IRQHandler\nUSB packet handling"]
+    subgraph "Background — ISR"
+        TICK["SysTick 1ms\nHAL_IncTick()"]
+        TIM2IRQ["TIM2_IRQHandler\nPWM edge capture\n→ rc_input.c globals"]
+        USBIRQ["USB_LP_IRQHandler\nUSB CDC packet"]
     end
 
-    subgraph "Foreground — Main Loop (continuous)"
-        TIMEOUT["Timeout Check\n50 ms window per channel"]
-        ATOMICREAD["Atomic Read\n__disable_irq()\nRead sharedPulseWidth_chN\n__enable_irq()"]
-        SERVO["Servo Mapping\nLinear scale + clamp\nTIM3 CCR update"]
-        LIGHTING["Lighting FSM\nOFF / ON / SOS"]
+    subgraph "Foreground — Main Loop"
+        UPD1["RC_Input_Update()\nPWM timeout check"]
+        UPD2["CRSF_Input_Update()\nDMA parse + timeout"]
+        SEL["Input MUX\nCRSF preferred"]
+        CTRL["Mode_Update → Demo\nor Servo + Lighting"]
     end
 
-    TICK --> ATOMICREAD
-    TIM2IRQ --> ATOMICREAD
-    TIMEOUT --> ATOMICREAD
-    ATOMICREAD --> SERVO
-    ATOMICREAD --> LIGHTING
+    TIM2IRQ --> UPD1
+    UPD1 --> UPD2
+    UPD2 --> SEL
+    SEL --> CTRL
 ```
-
-### Critical Section Pattern
-
-Because `sharedPulseWidth_chN` variables are written in ISR context and read in the main loop (both are wider than a single bus transaction on Cortex-M4), the firmware uses **global IRQ disable** as a simple critical section:
-
-```c
-__disable_irq();
-uint32_t currentPulse = sharedPulseWidth;
-uint32_t currentPulse_ch2 = sharedPulseWidth_ch2;
-uint32_t currentPulse_ch3 = sharedPulseWidth_ch3;
-__enable_irq();
-```
-
-> **Note:** On Cortex-M4, `uint32_t` reads are naturally atomic (single LDR instruction), but the grouped multi-variable read benefits from atomic protection to get a consistent snapshot.
 
 ---
 
-## 10. Data Flow Diagram
+## 12. Data Flow Diagram
 
 ```mermaid
 flowchart TD
-    A([Power On]) --> B[HAL_Init / SystemClock_Config\n170 MHz PLL]
-    B --> C[MX_GPIO_Init\nPA6 PC6 Output\nPA0-PA2 TIM2 AF\nPA4 PB0 TIM3 AF]
-    C --> D[MX_USB_Device_Init\nCDC VCP]
-    D --> E[MX_TIM2_Init\nInput Capture 3ch\n1µs resolution]
-    E --> F[MX_TIM3_Init\nPWM Output 2ch\n50Hz 1µs res]
-    F --> G["HAL_TIM_PWM_Start\n(TIM3 CH2, CH3)"]
-    G --> H["LED OFF\nServo → 500µs (0°)\nHAL_Delay 1000ms"]
-    H --> I["Init lastPulseTime = HAL_GetTick()\n(prevent false timeout)"]
-    I --> J["HAL_TIM_IC_Start_IT\n(TIM2 CH1, CH2, CH3)"]
-    J --> K{{"Main Loop"}}
+    A([Power On]) --> B[HAL_Init / SystemClock 170MHz]
+    B --> C[MX_GPIO_Init\nMX_DMA_Init\nMX_USB_Device_Init]
+    C --> D[MX_TIM2_Init / MX_TIM3_Init\nMX_USART3_UART_Init]
+    D --> E[Servo_Init → PWM start, 90° center\nHAL_Delay 1000ms]
+    E --> F[RC_Input_Init\nCRSF_Input_Init → HAL_UART_Receive_DMA\nMode_Init]
+    F --> G[HAL_TIM_IC_Start_IT TIM2 CH1/2/3]
+    G --> H{{Main Loop}}
 
-    K --> L[Timeout check per channel]
-    L --> M["Atomic read\n__disable_irq()\nRead 3x sharedPulseWidth\n__enable_irq()"]
-    M --> N{CH2 pulse > 0?}
-    N -->|Yes| O[Scale to 500-2500µs\nWrite TIM3_CH2 CCR]
-    N -->|No| P[TIM3_CH2 CCR = 0\nservo off]
-    O --> Q{CH3 pulse > 0?}
-    P --> Q
-    Q -->|Yes| R[Scale to 500-2500µs\nWrite TIM3_CH3 CCR]
-    Q -->|No| S[TIM3_CH3 CCR = 0\nservo off]
-    R --> T{CH1 pulse > 1750?}
-    S --> T
-    T -->|Yes| U[handleSOS\nnon-blocking]
-    T -->|No| V{1000 ≤ CH1 < 1250?}
-    V -->|Yes| W[LED ON\nPA6 SET]
-    V -->|No| X[LED OFF\nPA6 RESET]
-    U --> K
-    W --> K
-    X --> K
-
-    subgraph "ISR Context (asynchronous)"
-        ISR1["TIM2 CH1 Rising Edge\n→ store capture1\n→ set polarity FALLING"]
-        ISR2["TIM2 CH1 Falling Edge\n→ compute pulse\n→ validate 800-2200µs\n→ write sharedPulseWidth\n→ write lastPulseTime\n→ reset polarity RISING"]
-        ISR1 -.->|edge event| ISR2
-    end
-
-    J -.->|enables| ISR1
+    H --> I[RC_Input_Update\nCRSF_Input_Update]
+    I --> J{CRSF connected?}
+    J -->|Yes| K[ch1-3 = CRSF_Input_GetChX]
+    J -->|No| L[ch1-3 = RC_Input_GetChX]
+    K --> M[Mode_Update ch1]
+    L --> M
+    M --> N{DEMO mode?}
+    N -->|Yes| O[Demo_Performance]
+    N -->|No| P[Servo_Update ch2/ch3\nLighting_Update ch1]
+    O --> H
+    P --> H
 ```
 
 ---
 
-## 11. Pin Assignment Table
+## 13. Pin Assignment Table
 
 | Pin | Signal | Direction | Peripheral | Description |
 |---|---|---|---|---|
-| **PA0** | TIM2_CH1 | IN | TIM2 IC CH1 | RC receiver PWM — Lighting channel |
-| **PA1** | TIM2_CH2 | IN | TIM2 IC CH2 | RC receiver PWM — Servo 1 channel |
-| **PA2** | TIM2_CH3 | IN | TIM2 IC CH3 | RC receiver PWM — Servo 2 channel |
-| **PA4** | TIM3_CH2 | OUT | TIM3 PWM CH2 | Servo 1 output |
-| **PA6** | GPIO_Output | OUT | GPIO | Primary LED / lighting output |
+| **PA0** | TIM2_CH1 | IN | TIM2 IC CH1 | PWM — Lighting channel |
+| **PA1** | TIM2_CH2 | IN | TIM2 IC CH2 | PWM — Servo 1 |
+| **PA2** | TIM2_CH3 | IN | TIM2 IC CH3 | PWM — Servo 2 |
+| **PA4** | TIM3_CH2 | OUT | TIM3 PWM | Servo 1 output |
+| **PA6** | GPIO_Output | OUT | GPIO | LED / Lighting output |
 | **PA11** | USB_DM | USB | USB FS | USB D- |
 | **PA12** | USB_DP | USB | USB FS | USB D+ |
-| **PB0** | TIM3_CH3 | OUT | TIM3 PWM CH3 | Servo 2 output |
-| **PC6** | GPIO_Output | OUT | GPIO | Secondary LED output (reserved) |
+| **PB0** | TIM3_CH3 | OUT | TIM3 PWM | Servo 2 output |
+| **PB10** | USART3_TX | OUT | USART3 | CRSF Telemetry TX (dự phòng) |
+| **PB11** | USART3_RX | IN | USART3+DMA | **CRSF Receiver data input** |
+| **PC6** | GPIO_Output | OUT | GPIO | Secondary LED (reserved) |
 
 ---
 
-## 12. Clock Tree
+## 14. Clock Tree
 
 ```mermaid
 graph TD
-    HSI["HSI\n16 MHz Internal RC"] -->|PLL Source| PLL
-    HSI48["HSI48\n48 MHz Internal RC"] -->|USB Clock| USB["USB FS\n48 MHz"]
-
-    PLL["PLL\n÷4 → ×85 → ÷2\n= 170 MHz"] --> SYSCLK["SYSCLK\n170 MHz"]
-    SYSCLK --> AHB["AHB / HCLK\n÷1 → 170 MHz"]
-    AHB --> FCLK["FCLK (Cortex)\n170 MHz"]
-    AHB --> APB1["APB1\n÷1 → 170 MHz\n→ TIM2, TIM3 @ 170 MHz"]
-    AHB --> APB2["APB2\n÷1 → 170 MHz"]
-    AHB --> SYSTICK["SysTick\n1 ms tick"]
+    HSI["HSI 16 MHz"] -->|PLL ÷4 ×85 ÷2| SYSCLK["SYSCLK 170 MHz"]
+    HSI48["HSI48 48 MHz"] --> USB["USB FS 48 MHz"]
+    SYSCLK --> APB1["APB1 170 MHz\n→ TIM2, TIM3, USART3"]
+    SYSCLK --> SYSTICK["SysTick 1 ms"]
 ```
 
-**PLL Calculation:** HSI (16 MHz) → ÷ PLLM(4) = 4 MHz → × PLLN(85) = 340 MHz VCO → ÷ PLLR(2) = **170 MHz SYSCLK**
-
-Both TIM2 and TIM3 operate from the APB1 timer clock at **170 MHz**. With prescaler 169, the timer resolution is:
-
-> **1 tick = 1 µs** (170 MHz / 170 = 1 MHz timer clock)
+- **TIM2/TIM3:** Prescaler 169 → **1 µs/tick**
+- **USART3:** BRR = 170 000 000 / 420 000 ≈ 405 → **actual ≈ 420 kbaud**
 
 ---
 
-## 13. Memory Layout
-
-Based on the linker script `STM32G431XX_FLASH.ld`:
+## 15. Memory Layout
 
 ```
-┌────────────────────────────────────────────────┐  0x0800_0000
-│                  FLASH (128 KB)                │
-│  .isr_vector  — Vector table                   │
-│  .text        — Code                           │
-│  .rodata      — Constants (sosDelays[], etc.)  │
-│  .data (init) — Initialized data image         │
-└────────────────────────────────────────────────┘  0x0802_0000
+FLASH (128 KB) @ 0x0800_0000
+  .isr_vector, .text, .rodata (s_crc8_table, sosDelays, ...)
 
-┌────────────────────────────────────────────────┐  0x2000_0000
-│                   SRAM (32 KB)                 │
-│  .data        — Initialized globals            │
-│  .bss         — Zero-initialized globals       │
-│                 (sharedPulseWidth_*, etc.)      │
-│  Heap         — 0x200 (512 B)                  │
-│  Stack        — 0x400 (1 KB, grows downward)   │
-└────────────────────────────────────────────────┘  0x2000_8000
+SRAM (32 KB) @ 0x2000_0000
+  .data / .bss:
+    s_dma_buf[128]         — CRSF DMA receive buffer
+    s_crsf_data            — CRSF parsed data struct (~60 bytes)
+    s_pulseWidth_chN (×3)  — PWM shared vars
+    s_lastPulseTime_chN    — PWM timeout timestamps
+  Heap  : 512 B
+  Stack : 1 KB (grows down)
 ```
-
-> **Stack:** 1 KB — adequate for the flat superloop + ISR architecture (no deep recursion, no RTOS task stacks).  
-> **Heap:** 512 B — minimal; USB CDC middleware uses static buffers.
 
 ---
 
-## 14. Known Limitations & Future Work
+## 16. Known Limitations & Future Work
 
-### Current Limitations
-
-| # | Issue | Impact |
+| # | Vấn đề | Tác động |
 |---|---|---|
-| 1 | **Lighting output uses hard-coded `GPIOA, GPIO_PIN_6`** in `handleSOS()` and main loop, diverging from `gpio.c` which also configures PC6. | PC6 is never driven by the control logic. Inconsistency risk. |
-| 2 | **No hardware input filter** on TIM2 (ICFilter = 0). Noise rejection is entirely software (800–2200 µs window). | RF-induced glitches shorter than 800 µs or longer than 2200 µs are silently dropped, but glitches within the valid window will corrupt the reading. |
-| 3 | **`crsf.c` is referenced** in the build system (object files found in build directory) but the source file is missing from `Core/Src/`. | Dead build artifact. CRSF dual-mode feature is incomplete/removed. |
-| 4 | **No signal validity counter** — a single valid pulse after a dropout immediately resumes output. | Could cause a brief servo/LED jitter when signal intermittently returns. |
-| 5 | **`sosStep` and `GPIOA_PIN_6`** writes are not atomically protected from a hypothetical future CRSF-based path. | Safe for now in single-thread model. |
+| 1 | CRSF parse được thực hiện trực tiếp trên DMA buffer; nếu DMA wrap xảy ra giữa chừng một frame thì frame đó bị bỏ qua | Ít xảy ra ở 100 Hz, buffer 128 byte |
+| 2 | Chưa gửi Telemetry (Link Stats, Battery) ngược về TX qua USART3 TX | Tính năng nâng cao, dùng PB10 |
+| 3 | `sosStep` và GPIO không được bảo vệ nếu CRSF parser và PWM cùng trigger | An toàn trong mô hình single-thread hiện tại |
+| 4 | Chưa có signal quality counter (debounce) cho CRSF reconnect | Brief jitter khi signal intermittent |
 
-### Recommended Future Improvements
+### Hướng cải thiện
 
-| Priority | Improvement |
+| Priority | Cải tiến |
 |---|---|
-| 🔴 High | Unify lighting output pin. Consolidate to one pin and define it as a macro (e.g., `#define LED_PORT GPIOA`, `LED_PIN GPIO_PIN_6`) in `main.h` |
-| 🔴 High | Restore or remove `crsf.c`. Either add the missing source file or clean the CMakeLists to remove the stale reference. |
-| 🟡 Medium | Add input filter to TIM2 (`ICFilter = 0x8` ~ 6 samples) to reject sub-microsecond glitches at hardware level. |
-| 🟡 Medium | Add a **signal quality counter** (e.g., valid readings streak ≥ 3) before trusting a recovered signal. |
-| 🟢 Low | Add UART/USB diagnostic telemetry: periodic report of pulse widths, servo positions, and LED state. |
-| 🟢 Low | Refactor the 3 identical per-channel capture blocks into a single parameterized handler. |
-| 🟢 Low | Consider migrating to CRSF (UART3 @ 420000 baud) as the primary RC input for higher reliability and more channels. |
+| 🔴 High | Thêm CRSF Telemetry: gửi Battery/Link Stats ngược về TX |
+| 🟡 Medium | Tăng `CRSF_DMA_BUF_SIZE` lên 256 để giảm khả năng wrap |
+| 🟡 Medium | Thêm debounce counter cho `is_connected` (≥3 gói liên tiếp mới coi là kết nối) |
+| 🟢 Low | Thêm diagnostic LED hoặc USB CDC log khi chuyển đổi giữa 2 chế độ input |
 
 ---
 
-*Document generated by firmware architectural review — April 2026.*
+*Document v2.0 — Updated to reflect Dual-Mode PWM/CRSF Input — May 2026.*
