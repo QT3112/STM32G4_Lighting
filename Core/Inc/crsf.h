@@ -25,53 +25,53 @@
 extern "C" {
 #endif
 
-#include "main.h"   /* HAL, stdint */
-#include "usart.h"  /* huart3       */
+#include "main.h"  /* HAL, stdint */
+#include "usart.h" /* huart3       */
 
 /* ==========================================================================
  * Thông số vật lý UART/DMA
  * ========================================================================== */
 
 /** Kích thước DMA circular buffer (bytes). Phải là bội số 2. Tối thiểu 128 */
-#define CRSF_DMA_BUF_SIZE       128U
+#define CRSF_DMA_BUF_SIZE 128U
 
 /** Thời gian timeout kết nối (ms). Nếu không có packet hợp lệ trong khoảng
  *  này thì coi như mất tín hiệu và is_connected = 0.
  *  CRSF@420kbaud ở 100 Hz → 10 ms/frame. Chọn 300 ms ≈ miss 30 frame. */
-#define CRSF_TIMEOUT_MS         300U
+#define CRSF_TIMEOUT_MS 300U
 
 /* ==========================================================================
  * Hằng số giao thức CRSF
  * ========================================================================== */
 
 /** Địa chỉ thiết bị */
-#define CRSF_ADDRESS_BROADCAST          0x00U
-#define CRSF_ADDRESS_FLIGHT_CONTROLLER  0xC8U
-#define CRSF_ADDRESS_RADIO_TRANSMITTER  0xEAU
-#define CRSF_ADDRESS_CRSF_RECEIVER      0xECU
-#define CRSF_ADDRESS_CRSF_TRANSMITTER   0xEEU
+#define CRSF_ADDRESS_BROADCAST 0x00U
+#define CRSF_ADDRESS_FLIGHT_CONTROLLER 0xC8U
+#define CRSF_ADDRESS_RADIO_TRANSMITTER 0xEAU
+#define CRSF_ADDRESS_CRSF_RECEIVER 0xECU
+#define CRSF_ADDRESS_CRSF_TRANSMITTER 0xEEU
 
 /** Loại frame */
-#define CRSF_FRAMETYPE_BATTERY_SENSOR   0x08U
-#define CRSF_FRAMETYPE_LINK_STATISTICS  0x14U
-#define CRSF_FRAMETYPE_RC_CHANNELS      0x16U
-#define CRSF_FRAMETYPE_ATTITUDE         0x1EU
-#define CRSF_FRAMETYPE_FLIGHT_MODE      0x21U
+#define CRSF_FRAMETYPE_BATTERY_SENSOR 0x08U
+#define CRSF_FRAMETYPE_LINK_STATISTICS 0x14U
+#define CRSF_FRAMETYPE_RC_CHANNELS 0x16U
+#define CRSF_FRAMETYPE_ATTITUDE 0x1EU
+#define CRSF_FRAMETYPE_FLIGHT_MODE 0x21U
 
 /** Kích thước payload cố định */
-#define CRSF_PAYLOAD_SIZE_RC_CHANNELS   22U   /* 16 kênh × 11-bit = 22 byte */
-#define CRSF_PAYLOAD_SIZE_LINK_STATS    10U
-#define CRSF_PAYLOAD_SIZE_BATTERY       8U
-#define CRSF_PAYLOAD_SIZE_ATTITUDE      6U
-#define CRSF_FLIGHT_MODE_STR_LEN        16U   /* bao gồm null terminator */
+#define CRSF_PAYLOAD_SIZE_RC_CHANNELS 22U /* 16 kênh × 11-bit = 22 byte */
+#define CRSF_PAYLOAD_SIZE_LINK_STATS 10U
+#define CRSF_PAYLOAD_SIZE_BATTERY 8U
+#define CRSF_PAYLOAD_SIZE_ATTITUDE 6U
+#define CRSF_FLIGHT_MODE_STR_LEN 16U /* bao gồm null terminator */
 
 /** Số kênh RC tối đa */
-#define CRSF_MAX_CHANNELS               16U
+#define CRSF_MAX_CHANNELS 16U
 
 /** Giới hạn giá trị kênh CRSF thô (11-bit: 0..2047) */
-#define CRSF_CHANNEL_MIN                172U   /* ≈  988 µs */
-#define CRSF_CHANNEL_CENTER             992U   /* = 1500 µs */
-#define CRSF_CHANNEL_MAX               1811U   /* ≈ 2012 µs */
+#define CRSF_CHANNEL_MIN 172U    /* ≈  988 µs */
+#define CRSF_CHANNEL_CENTER 992U /* = 1500 µs */
+#define CRSF_CHANNEL_MAX 1811U   /* ≈ 2012 µs */
 
 /**
  * @brief Chuyển đổi giá trị kênh CRSF thô (11-bit) sang µs.
@@ -81,8 +81,7 @@ extern "C" {
  *
  *  Kết quả được clamp về [1000, 2000] trong CRSF_Input_GetChX().
  */
-#define CRSF_TO_US(raw) \
-    ((int32_t)(((int32_t)(raw) - 992) * 5 / 8 + 1500))
+#define CRSF_TO_US(raw) ((int32_t)(((int32_t)(raw)-992) * 5 / 8 + 1500))
 
 /* ==========================================================================
  * Cấu trúc dữ liệu
@@ -90,16 +89,16 @@ extern "C" {
 
 /** Link Statistics (frame 0x14) */
 typedef struct {
-    uint8_t  uplink_rssi_ant1;       /**< RSSI anten 1 (dBm * -1) */
-    uint8_t  uplink_rssi_ant2;       /**< RSSI anten 2 (dBm * -1) */
-    uint8_t  uplink_link_quality;    /**< Link quality uplink (%) */
-    int8_t   uplink_snr;             /**< SNR uplink (dB) */
-    uint8_t  active_antenna;         /**< Anten đang dùng (0/1) */
-    uint8_t  rf_mode;                /**< Chế độ RF profile */
-    uint8_t  uplink_tx_power;        /**< Công suất TX */
-    uint8_t  downlink_rssi;          /**< RSSI downlink (dBm * -1) */
-    uint8_t  downlink_link_quality;  /**< Link quality downlink (%) */
-    int8_t   downlink_snr;           /**< SNR downlink (dB) */
+  uint8_t uplink_rssi_ant1;      /**< RSSI anten 1 (dBm * -1) */
+  uint8_t uplink_rssi_ant2;      /**< RSSI anten 2 (dBm * -1) */
+  uint8_t uplink_link_quality;   /**< Link quality uplink (%) */
+  int8_t uplink_snr;             /**< SNR uplink (dB) */
+  uint8_t active_antenna;        /**< Anten đang dùng (0/1) */
+  uint8_t rf_mode;               /**< Chế độ RF profile */
+  uint8_t uplink_tx_power;       /**< Công suất TX */
+  uint8_t downlink_rssi;         /**< RSSI downlink (dBm * -1) */
+  uint8_t downlink_link_quality; /**< Link quality downlink (%) */
+  int8_t downlink_snr;           /**< SNR downlink (dB) */
 } CRSF_LinkStats_t;
 
 /**
@@ -109,33 +108,33 @@ typedef struct {
  *  hay chưa (0 = chưa, 1 = đã có giá trị hợp lệ ít nhất 1 lần).
  */
 typedef struct {
-    /* --- RC Channels (frame 0x16) --- */
-    uint16_t channels[CRSF_MAX_CHANNELS]; /**< Giá trị thô 11-bit [0..2047] */
+  /* --- RC Channels (frame 0x16) --- */
+  uint16_t channels[CRSF_MAX_CHANNELS]; /**< Giá trị thô 11-bit [0..2047] */
 
-    /* --- Kết nối & thời gian --- */
-    uint8_t  is_connected;          /**< 1 = có tín hiệu, 0 = mất tín hiệu */
-    uint32_t last_packet_time;      /**< HAL_GetTick() của gói hợp lệ cuối   */
+  /* --- Kết nối & thời gian --- */
+  uint8_t is_connected;      /**< 1 = có tín hiệu, 0 = mất tín hiệu */
+  uint32_t last_packet_time; /**< HAL_GetTick() của gói hợp lệ cuối   */
 
-    /* --- Link Statistics (frame 0x14) --- */
-    CRSF_LinkStats_t link_stats;
-    uint8_t  has_link_stats;
+  /* --- Link Statistics (frame 0x14) --- */
+  CRSF_LinkStats_t link_stats;
+  uint8_t has_link_stats;
 
-    /* --- Battery Sensor (frame 0x08) --- */
-    uint32_t battery_voltage_mv;    /**< Điện áp pin (mV) */
-    uint32_t battery_current_ma;    /**< Dòng tiêu thụ (mA) */
-    uint32_t battery_capacity_mah;  /**< Dung lượng đã dùng (mAh) */
-    uint8_t  battery_remaining_pct; /**< Pin còn lại (%) */
-    uint8_t  has_battery;
+  /* --- Battery Sensor (frame 0x08) --- */
+  uint32_t battery_voltage_mv;   /**< Điện áp pin (mV) */
+  uint32_t battery_current_ma;   /**< Dòng tiêu thụ (mA) */
+  uint32_t battery_capacity_mah; /**< Dung lượng đã dùng (mAh) */
+  uint8_t battery_remaining_pct; /**< Pin còn lại (%) */
+  uint8_t has_battery;
 
-    /* --- Attitude (frame 0x1E) --- */
-    float    pitch_rad;             /**< Pitch (radian) */
-    float    roll_rad;              /**< Roll (radian) */
-    float    yaw_rad;               /**< Yaw (radian) */
-    uint8_t  has_attitude;
+  /* --- Attitude (frame 0x1E) --- */
+  float pitch_rad; /**< Pitch (radian) */
+  float roll_rad;  /**< Roll (radian) */
+  float yaw_rad;   /**< Yaw (radian) */
+  uint8_t has_attitude;
 
-    /* --- Flight Mode (frame 0x21) --- */
-    char     flight_mode[CRSF_FLIGHT_MODE_STR_LEN];
-    uint8_t  has_flight_mode;
+  /* --- Flight Mode (frame 0x21) --- */
+  char flight_mode[CRSF_FLIGHT_MODE_STR_LEN];
+  uint8_t has_flight_mode;
 
 } CRSF_Data_t;
 
@@ -167,7 +166,7 @@ void CRSF_ResetData(CRSF_Data_t *data);
  * @return        Số frame hợp lệ đã parse được (0 nếu không có frame nào).
  */
 uint8_t CRSF_ParseFrame(const uint8_t *buffer, uint16_t length,
-                         CRSF_Data_t *data);
+                        CRSF_Data_t *data);
 
 /**
  * @brief Chuyển đổi giá trị kênh thô sang µs, clamp về [1000, 2000].
@@ -237,6 +236,11 @@ uint32_t CRSF_Input_GetCh2(void);
  * @return µs trong [1000..2000], hoặc 0 nếu mất tín hiệu.
  */
 uint32_t CRSF_Input_GetCh6(void);
+
+/**
+ * @brief Hàm ví dụ để kiểm tra file crsf.c có sử dụng được printf() hay không
+ */
+void CRSF_test_printf(void);
 
 #ifdef __cplusplus
 }
