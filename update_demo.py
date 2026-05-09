@@ -1,4 +1,6 @@
-/**
+import os
+
+content = """/**
  ******************************************************************************
  * @file    demo_performance.c
  * @brief   Implement hàm biểu diễn thiết bị (Demo Performance).
@@ -363,3 +365,7 @@ void Demo_Performance(void)
             break;
     }
 }
+"""
+
+with open('Core/Src/demo_performance.c', 'w') as f:
+    f.write(content)

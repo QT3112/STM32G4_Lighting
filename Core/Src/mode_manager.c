@@ -53,7 +53,7 @@ static inline uint8_t isInOnZone(uint32_t pulse)
 
 void Mode_Init(void)
 {
-    s_mode        = APP_MODE_NORMAL;
+    s_mode        = APP_MODE_DEMO;
     s_onCount     = 0;
     s_windowStart = 0;
     s_wasInOnZone = 0;

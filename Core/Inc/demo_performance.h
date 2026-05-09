@@ -50,13 +50,15 @@ typedef enum {
     DEMO_STEP4_LIGHT_ON,         /**< Bước 4: Đèn sáng                    */
     DEMO_STEP5_S1_FAST,          /**< Bước 5: Servo1 xoay nhanh hơn ra & về */
     DEMO_STEP6_S2_FAST,          /**< Bước 6: Servo2 xoay nhanh hơn ra & về */
-    DEMO_STEP7_SOS               /**< Bước 7: Chế độ SOS                  */
+    DEMO_STEP7_SOS,              /**< Bước 7: Chế độ SOS                  */
+    DEMO_STEP8_BOTH_SERVOS       /**< Bước 8: Hai servo xoay cùng lúc     */
 } DemoStep_t;
 
 /** Hướng chuyển động của servo trong bước hiện tại */
 typedef enum {
-    SERVO_DIR_FORWARD = 0,       /**< Đang xoay ra (MIN → MAX) */
-    SERVO_DIR_RETURN             /**< Đang quay về  (MAX → MIN) */
+    SERVO_DIR_FORWARD = 0,       /**< Đang xoay ra MAX */
+    SERVO_DIR_RETURN,            /**< Đang quay về MIN */
+    SERVO_DIR_TO_MID             /**< Đang quay về MID (90 độ) */
 } ServoDir_t;
 
 /* Exported function prototypes ----------------------------------------------*/
