@@ -20,18 +20,20 @@
 #include "main.h"
 #include "lighting_control.h"   /* Dùng lại ngưỡng LIGHT_ZONE_ON_MIN/MAX */
 
-/* Tham số phát hiện cử chỉ ------------------------------------------------- */
-/* Số lần bật đèn (rising edge vào ON-zone) cần để kích hoạt toggle.          */
+/* Số lần bật đèn để toggle NORMAL ↔ DEMO */
 #define GESTURE_TRIGGER_COUNT   3U
 
-/* Cửa sổ thời gian tối đa cho 3 lần bật (ms).                               */
-/* Nếu các lần bật không hoàn thành trong khoảng này, bộ đếm reset.           */
+/* Số lần bật đèn để kích hoạt GIMBAL mode */
+#define GESTURE_GIMBAL_COUNT    5U
+
+/* Cửa sổ thời gian tối đa cho cả hai cử chỉ (ms). */
 #define GESTURE_WINDOW_MS       3000U
 
 /* Kiểu enum chế độ hoạt động ----------------------------------------------- */
 typedef enum {
-    APP_MODE_NORMAL = 0,    /* Chế độ điều khiển bình thường (RC → servo + đèn) */
-    APP_MODE_DEMO           /* Chế độ biểu diễn tự động (Demo_Performance)       */
+    APP_MODE_NORMAL = 0,    /*!< Chế độ điều khiển bình thường (RC → servo + đèn) */
+    APP_MODE_DEMO,          /*!< Chế độ biểu diễn tự động (Demo_Performance)       */
+    APP_MODE_GIMBAL         /*!< Chế độ cân bằng Gimbal (Cascaded PID + Kalman)    */
 } AppMode;
 
 /**
@@ -48,8 +50,14 @@ void Mode_Update(uint32_t pulseCh1);
 
 /**
  * @brief Lấy chế độ hoạt động hiện tại.
- * @return APP_MODE_NORMAL hoặc APP_MODE_DEMO.
+ * @return APP_MODE_NORMAL, APP_MODE_DEMO, hoặc APP_MODE_GIMBAL.
  */
 AppMode Mode_Get(void);
+
+/**
+ * @brief Ép buộc đặt chế độ trực tiếp (dùng nội bộ hoặc test).
+ * @param mode  Chế độ muốn chuyển sang.
+ */
+void Mode_Set(AppMode mode);
 
 #endif /* MODE_MANAGER_H */

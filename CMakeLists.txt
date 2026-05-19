@@ -51,6 +51,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/servo_control.c
     Core/Src/lighting_control.c
     Core/Src/mode_manager.c
+    Core/Src/mpu6050.c
+    Core/Src/pid.c
+    Core/Src/kalman.c
+    Core/Src/gimbal_control.c
 )
 
 # Add include paths
@@ -69,6 +73,7 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
+    m   # math library: atan2f, sqrtf (dùng trong gimbal_control.c, kalman.c)
 
     # Add user defined libraries
 )

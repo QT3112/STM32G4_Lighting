@@ -18,17 +18,22 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
+#include "stm32g4xx_hal.h"
 #include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include "demo_performance.h"
 #include "rc_input.h"
 #include "servo_control.h"
 #include "lighting_control.h"
 #include "mode_manager.h"
+#include "mpu6050.h"
+#include "gimbal_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,8 +54,9 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* Tất cả biến shared đã được chuyển vào rc_input.c (static nội bộ).       */
-/* Truy xuất qua RC_Input_GetCh1/2/3().                                      */
+/* Handle MPU6050 và Gimbal Controller (khai báo tại đây để chia sẻ với callback) */
+MPU6050_Handle_t    hMpu;
+GimbalControl_Handle_t hGimbal;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,6 +74,17 @@ void SystemClock_Config(void);
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
   RC_Input_CaptureCallback(htim);
+}
+
+/**
+ * @brief HAL callback cho EXTI (PA15) – MPU6050 Data-Ready Interrupt.
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == MPU6050_INT_PIN)
+  {
+    MPU6050_DRDY_Callback(&hMpu);
+  }
 }
 
 /* USER CODE END 0 */
@@ -104,6 +121,8 @@ int main(void)
   MX_USB_Device_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_TIM6_Init();
+  MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
 
   /* 1. Tắt đèn mặc định */
@@ -115,13 +134,33 @@ int main(void)
   /* 3. Cấp xung 1 giây để servo ổn định về vị trí gốc */
   HAL_Delay(1000);
 
-  /* 4. Khởi tạo RC Input (ghi lastPulseTime = now sau delay, tránh timeout sớm) */
+  /* 4. Khởi tạo RC Input */
   RC_Input_Init();
 
   /* 5. Khởi tạo bộ quản lý chế độ (mặc định: NORMAL) */
   Mode_Init();
 
-  /* 6. Khởi động Input Capture ngắt */
+  /* 6. Khởi tạo MPU6050 (I2C3, DRDY trên PA15) */
+  uint8_t check_connect_MPU;
+  check_connect_MPU = MPU6050_Init(&hMpu,
+                    MPU6050_GYRO_FS_500DPS,
+                    MPU6050_ACCEL_FS_4G,
+                    MPU6050_DLPF_BW_044HZ);
+  if (check_connect_MPU != HAL_OK)
+  {
+    /* Không kết nối được MPU6050 – kiểm tra dây I2C3 */
+    printf("MPU6050 Init: FAIL! Check I2C3 wiring (PA8, PC11).\r\n");
+    /* Khong goi Error_Handler() vi no se tat ngat (__disable_irq), lam chet USB CDC */
+  }
+  else
+  {
+    printf("MPU6050 Init: OK!\r\n");
+  }
+
+  /* 7. Khởi tạo Gimbal Controller (tham số PID mặc định) */
+  Gimbal_Init(&hGimbal);
+
+  /* 8. Khởi động Input Capture ngắt */
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
@@ -133,6 +172,9 @@ int main(void)
   while (1)
   {
     /* 1. Cập nhật timeout, reset pulse nếu mất tín hiệu */
+    // printf("check MPU: %d \n", check_connect_MPU);
+    // HAL_Delay(1000);
+    
     RC_Input_Update();
 
     /* 2. Đọc giá trị xung an toàn từ ISR */
@@ -150,11 +192,43 @@ int main(void)
       /* CHẾ ĐỘ DEMO: đèn do Demo_Performance() điều khiển */
       Demo_Performance();
     }
+    else if (Mode_Get() == APP_MODE_GIMBAL)
+    {
+      /* CHẾ ĐỘ GIMBAL: đọc IMU + chạy Cascaded PID ổn định 2 trục */
+      if (MPU6050_IsDataReady(&hMpu))
+      {
+        MPU6050_Update(&hMpu);
+        Gimbal_Update(&hGimbal, &hMpu);
+      }
+    }
     else
     {
       /* CHẾ ĐỘ NORMAL: servo + đèn theo tín hiệu RC */
       Servo_Update(ch2, ch3);
       Lighting_Update(ch1);
+    }
+
+    /* 5. In log định kỳ mỗi 500ms để kiểm tra */
+    static uint32_t last_print_tick = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - last_print_tick >= 500)
+    {
+      last_print_tick = now;
+      AppMode mode = Mode_Get();
+      if (mode == APP_MODE_NORMAL)
+      {
+        printf("[MODE] NORMAL - RC CH1:%lu CH2:%lu CH3:%lu (MPU status: %d)\r\n", ch1, ch2, ch3, check_connect_MPU);
+      }
+      else if (mode == APP_MODE_DEMO)
+      {
+        printf("[MODE] DEMO - Playing sequence...\r\n");
+      }
+      else if (mode == APP_MODE_GIMBAL)
+      {
+        printf("[MODE] GIMBAL - Pitch(Kal): %.2f | Roll(Comp): %.2f | Servo P:%lu Y:%lu\r\n",
+               hGimbal.kalman_pitch.angle, hMpu.angle.roll,
+               hGimbal.servo_pitch_us, hGimbal.servo_yaw_us);
+      }
     }
 
     /* USER CODE END WHILE */
