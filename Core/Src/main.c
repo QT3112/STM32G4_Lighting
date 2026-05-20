@@ -32,8 +32,9 @@
 #include "servo_control.h"
 #include "lighting_control.h"
 #include "mode_manager.h"
-#include "mpu6050.h"
-#include "gimbal_control.h"
+#include "imu_dual.h"         /* Driver dual MPU6050 (0x68 + 0x69) */
+#include "fusion.h"           /* Complementary Filter               */
+#include "gimbal_control.h"   /* Gimbal controller (rewritten)      */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,9 +55,16 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* Handle MPU6050 và Gimbal Controller (khai báo tại đây để chia sẻ với callback) */
-MPU6050_Handle_t    hMpu;
+
+/* Dual IMU handle: Frame(0x68) + Camera(0x69) */
+ImuDual_Handle_t     hImuDual;
+
+/* Gimbal controller handle */
 GimbalControl_Handle_t hGimbal;
+
+/* Extern flag set bởi TIM6 ISR @ 500Hz (khai báo trong stm32g4xx_it.c) */
+extern volatile uint8_t g_gimbal_tick_flag;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,17 +82,6 @@ void SystemClock_Config(void);
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
   RC_Input_CaptureCallback(htim);
-}
-
-/**
- * @brief HAL callback cho EXTI (PA15) – MPU6050 Data-Ready Interrupt.
- */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if (GPIO_Pin == MPU6050_INT_PIN)
-  {
-    MPU6050_DRDY_Callback(&hMpu);
-  }
 }
 
 /* USER CODE END 0 */
@@ -128,42 +125,40 @@ int main(void)
   /* 1. Tắt đèn mặc định */
   HAL_GPIO_WritePin(LIGHT_GPIO_PORT, LIGHT_GPIO_PIN, GPIO_PIN_RESET);
 
-  /* 2. Khởi tạo servo: bật PWM và về 90° */
+  /* 2. Khởi tạo servo: bật PWM và về 90° (center = 1500µs) */
   Servo_Init();
 
-  /* 3. Cấp xung 1 giây để servo ổn định về vị trí gốc */
+  /* 3. Cấp xung 1 giây để servo ổn định */
   HAL_Delay(1000);
 
   /* 4. Khởi tạo RC Input */
   RC_Input_Init();
 
-  /* 5. Khởi tạo bộ quản lý chế độ (mặc định: NORMAL) */
+  /* 5. Khởi tạo bộ quản lý chế độ (mặc định: GIMBAL) */
   Mode_Init();
 
-  /* 6. Khởi tạo MPU6050 (I2C3, DRDY trên PA15) */
-  uint8_t check_connect_MPU;
-  check_connect_MPU = MPU6050_Init(&hMpu,
-                    MPU6050_GYRO_FS_500DPS,
-                    MPU6050_ACCEL_FS_4G,
-                    MPU6050_DLPF_BW_044HZ);
-  if (check_connect_MPU != HAL_OK)
+  /* 6. Khởi tạo Dual IMU (Frame @ 0x68 + Camera @ 0x69 trên I2C3) */
+  if (ImuDual_Init(&hImuDual) != HAL_OK)
   {
-    /* Không kết nối được MPU6050 – kiểm tra dây I2C3 */
-    printf("MPU6050 Init: FAIL! Check I2C3 wiring (PA8, PC11).\r\n");
-    /* Khong goi Error_Handler() vi no se tat ngat (__disable_irq), lam chet USB CDC */
+    printf("[MAIN] Dual IMU init FAIL — check I2C3 wiring & AD0 pins.\r\n");
+    /* Không gọi Error_Handler() để USB CDC vẫn hoạt động cho debug */
   }
   else
   {
-    printf("MPU6050 Init: OK!\r\n");
+    /* 7. Calibrate gyro bias (~1 giây, gimbal phải bất động) */
+    ImuDual_Calibrate(&hImuDual);
+
+    /* 8. Khởi tạo Gimbal Controller */
+    Gimbal_Init(&hGimbal, &hImuDual);
   }
 
-  /* 7. Khởi tạo Gimbal Controller (tham số PID mặc định) */
-  Gimbal_Init(&hGimbal);
-
-  /* 8. Khởi động Input Capture ngắt */
+  /* 9. Khởi động Input Capture interrupt (RC) */
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
   HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
+
+  /* 10. Khởi động TIM6 @ 500Hz — kích hoạt g_gimbal_tick_flag trong ISR */
+  HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
 
@@ -172,9 +167,6 @@ int main(void)
   while (1)
   {
     /* 1. Cập nhật timeout, reset pulse nếu mất tín hiệu */
-    // printf("check MPU: %d \n", check_connect_MPU);
-    // HAL_Delay(1000);
-    
     RC_Input_Update();
 
     /* 2. Đọc giá trị xung an toàn từ ISR */
@@ -182,24 +174,36 @@ int main(void)
     uint32_t ch2 = RC_Input_GetCh2();
     uint32_t ch3 = RC_Input_GetCh3();
 
-    /* 3. Cập nhật bộ phát hiện cử chỉ toggle chế độ
-          (luôn chạy dù đang ở chế độ nào) */
+    /* 3. Cập nhật bộ phát hiện cử chỉ toggle chế độ */
     Mode_Update(ch1);
 
     /* 4. Điều phối theo chế độ hiện tại */
     if (Mode_Get() == APP_MODE_DEMO)
     {
-      /* CHẾ ĐỘ DEMO: đèn do Demo_Performance() điều khiển */
+      /* CHẾ ĐỘ DEMO */
       Demo_Performance();
     }
     else if (Mode_Get() == APP_MODE_GIMBAL)
     {
-      /* CHẾ ĐỘ GIMBAL: đọc IMU + chạy Cascaded PID ổn định 2 trục */
-      if (MPU6050_IsDataReady(&hMpu))
+      /* CHẾ ĐỘ GIMBAL — 500Hz flag-based control loop
+       *
+       * TIM6 ISR set g_gimbal_tick_flag = 1 mỗi 2ms (500Hz).
+       * Main loop kiểm tra flag, xóa và gọi Gimbal_Tick().
+       *
+       * Tại sao không gọi trong ISR?
+       *   Gimbal_Tick() thực hiện HAL_I2C_Mem_Read() (blocking ~400µs).
+       *   Nếu I2C3 EV interrupt có priority thấp hơn TIM6, I2C sẽ timeout
+       *   vì EV không thể preempt TIM6 ISR → deadlock.
+       *   Giải pháp: ISR chỉ set flag (< 1µs), main loop làm việc nặng.
+       */
+      if (g_gimbal_tick_flag)
       {
-        MPU6050_Update(&hMpu);
-        Gimbal_Update(&hGimbal, &hMpu);
+        g_gimbal_tick_flag = 0;   /* Clear flag trước khi xử lý */
+        Gimbal_Tick(&hGimbal, &hImuDual);
       }
+
+      /* Telemetry & CLI (200ms interval, không blocking) */
+      Gimbal_Update(&hGimbal);
     }
     else
     {
@@ -208,7 +212,7 @@ int main(void)
       Lighting_Update(ch1);
     }
 
-    /* 5. In log định kỳ mỗi 500ms để kiểm tra */
+    /* 5. Mode status log mỗi 500ms */
     static uint32_t last_print_tick = 0;
     uint32_t now = HAL_GetTick();
     if (now - last_print_tick >= 500)
@@ -217,18 +221,24 @@ int main(void)
       AppMode mode = Mode_Get();
       if (mode == APP_MODE_NORMAL)
       {
-        printf("[MODE] NORMAL - RC CH1:%lu CH2:%lu CH3:%lu (MPU status: %d)\r\n", ch1, ch2, ch3, check_connect_MPU);
+        printf("[MODE] NORMAL - RC CH1:%lu CH2:%lu CH3:%lu\r\n", ch1, ch2, ch3);
       }
       else if (mode == APP_MODE_DEMO)
       {
-        printf("[MODE] DEMO - Playing sequence...\r\n");
+        printf("[MODE] DEMO\r\n");
       }
       else if (mode == APP_MODE_GIMBAL)
       {
-        printf("[MODE] GIMBAL - Pitch(Kal): %.2f | Roll(Comp): %.2f | Servo P:%lu Y:%lu\r\n",
-               hGimbal.kalman_pitch.angle, hMpu.angle.roll,
-               hGimbal.servo_pitch_us, hGimbal.servo_yaw_us);
+        /* In trạng thái giao tiếp và dữ liệu thô để kiểm tra MPU6050 */
+        printf("[DEBUG IMU] Frame(0x68) Init:%d Read:%d | Cam(0x69) Init:%d Read:%d\r\n", 
+               hImuDual.frame.initialized, hImuDual.frame.read_ok,
+               hImuDual.camera.initialized, hImuDual.camera.read_ok);
+               
+        printf("[DEBUG IMU] Frame Accel: X=%.2f Y=%.2f Z=%.2f | Cam Accel: X=%.2f Y=%.2f Z=%.2f\r\n",
+               hImuDual.frame.scaled.accel_x, hImuDual.frame.scaled.accel_y, hImuDual.frame.scaled.accel_z,
+               hImuDual.camera.scaled.accel_x, hImuDual.camera.scaled.accel_y, hImuDual.camera.scaled.accel_z);
       }
+      /* GIMBAL mode: telemetry đã được in bởi Gimbal_Update() @ 200ms */
     }
 
     /* USER CODE END WHILE */

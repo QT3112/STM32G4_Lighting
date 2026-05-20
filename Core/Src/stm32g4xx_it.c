@@ -42,6 +42,14 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
 
+/**
+ * @brief  Flag đặt bởi TIM6 ISR @ 500Hz để kích hoạt Gimbal_Tick().
+ *         Main loop kiểm tra và xóa flag này, sau đó gọi Gimbal_Tick().
+ *         Dùng flag thay vì gọi trực tiếp vì Gimbal_Tick() thực hiện
+ *         I2C blocking read — không an toàn trong ISR context.
+ */
+volatile uint8_t g_gimbal_tick_flag = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -249,6 +257,12 @@ void EXTI15_10_IRQHandler(void)
 void TIM6_DAC_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM6_DAC_IRQn 0 */
+
+  /* Set flag để main loop biết đã đến lúc chạy gimbal control tick.
+   * Không gọi Gimbal_Tick() trực tiếp tại đây vì nó thực hiện
+   * HAL_I2C_Mem_Read() (blocking) — sẽ deadlock nếu I2C interrupt
+   * có priority thấp hơn TIM6. */
+  g_gimbal_tick_flag = 1;
 
   /* USER CODE END TIM6_DAC_IRQn 0 */
   HAL_TIM_IRQHandler(&htim6);

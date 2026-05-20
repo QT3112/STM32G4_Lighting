@@ -52,6 +52,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/lighting_control.c
     Core/Src/mode_manager.c
     Core/Src/mpu6050.c
+    Core/Src/imu_dual.c
+    Core/Src/fusion.c
     Core/Src/pid.c
     Core/Src/kalman.c
     Core/Src/gimbal_control.c
@@ -69,6 +71,11 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
+
+# Enable float formatting for printf
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+    -u _printf_float
+)
 
 # Add linked libraries
 target_link_libraries(${CMAKE_PROJECT_NAME}

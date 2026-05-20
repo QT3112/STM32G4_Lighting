@@ -1,221 +1,417 @@
 /**
  * @file    gimbal_control.c
- * @brief   Gimbal 2-trục (Pitch & Yaw) – Cascaded PID + Kalman Filter.
+ * @brief   Gimbal 2 trục — Dual IMU, Complementary Filter, Cascaded PID,
+ *          Feedforward, 500Hz flag-based control loop.
  *
- *  Luồng dữ liệu mỗi chu kỳ (Gimbal_Update):
+ *  Control flow (mỗi Gimbal_Tick() @ 500Hz):
  *
- *  MPU6050_Update()        → raw accel/gyro
- *  Kalman_Update(pitch)    → pitch_angle (°)    [Accel + Gyro X]
- *  ─────────────────────────────────────────────────────────────
- *  PITCH AXIS (Cascaded):
- *    Angle PID:   error = pitch_setpoint - pitch_angle
- *                 output → rate_setpoint (°/s)
- *    Rate PID:    error = rate_setpoint - gyro_x (°/s)
- *                 output → pitch_offset (µs)
- *    servo_pitch = CENTER + pitch_offset   [clamp 1000–2000]
+ *  1. Đọc cả 2 IMU qua I2C3 (blocking, ~400µs)
+ *  2. Complementary Filter cho từng IMU → góc Pitch, Roll
+ *  3. Tính relative error:
+ *       err_pitch = (cam_pitch - frame_pitch) - setpoint_pitch
+ *       err_yaw   = (cam_gyro_z - frame_gyro_z) - setpoint_yaw_rate
+ *  4. Pitch Cascaded PID:
+ *       rate_sp = AnglePID(err_pitch)
+ *       offset  = RatePID(rate_sp - cam_gyro_x) + Kff × frame_gyro_x
+ *  5. Yaw Rate PID:
+ *       offset  = RatePID(err_yaw) + Kff × frame_gyro_z
+ *  6. Servo output:
+ *       CCR = SERVO_CENTER ± SIGN × offset (clamp 500–2500µs)
  *
- *  YAW AXIS (Rate only):
- *    Rate PID:    error = yaw_rate_sp - gyro_z (°/s)
- *                 output → yaw_offset (µs)
- *    servo_yaw   = CENTER + yaw_offset    [clamp 1000–2000]
- *  ─────────────────────────────────────────────────────────────
- *  Ghi TIM3 CH2 (Pitch), TIM3 CH3 (Yaw)
+ *  Notes:
+ *  - Không gọi printf() từ Gimbal_Tick() (ISR-adjacent, không an toàn)
+ *  - Telemetry được copy vào struct và in từ Gimbal_Update() ở main loop
  */
 
 #include "gimbal_control.h"
-#include <math.h>   /* atan2f, sqrtf */
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
 
-/* ============================================================================
- *  MACRO NỘI BỘ
- * ============================================================================ */
+/* ===========================================================================
+ *  PRIVATE HELPERS
+ * =========================================================================== */
 
-/** Clamp uint32 trong khoảng [lo, hi] */
-static inline uint32_t _clamp_u32(float val, uint32_t lo, uint32_t hi)
+/** Clamp float trong khoảng [lo, hi] */
+static inline float _clampf(float v, float lo, float hi)
 {
-    if (val < (float)lo) return lo;
-    if (val > (float)hi) return hi;
-    return (uint32_t)val;
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
-/* ============================================================================
- *  PUBLIC API
- * ============================================================================ */
-
-void Gimbal_Init(GimbalControl_Handle_t *hgimbal)
+/** Clamp và convert sang uint32_t cho CCR register */
+static inline uint32_t _servo_clamp(float us)
 {
-    /* ---- Kalman Filter – Pitch ---- */
-    Kalman_Init(&hgimbal->kalman_pitch,
-                0.001f,   /* Q_angle  */
-                0.003f,   /* Q_bias   */
-                0.03f);   /* R_measure */
+    if (us < (float)GIMBAL_SERVO_MIN_US) return GIMBAL_SERVO_MIN_US;
+    if (us > (float)GIMBAL_SERVO_MAX_US) return GIMBAL_SERVO_MAX_US;
+    return (uint32_t)us;
+}
 
-    /* ---- Cascaded PID – Pitch Angle (vòng ngoài) ---- */
-    PID_Init(&hgimbal->pid_pitch_angle,
+/* ===========================================================================
+ *  PUBLIC API
+ * =========================================================================== */
+
+void Gimbal_Init(GimbalControl_Handle_t *hg, ImuDual_Handle_t *hImu)
+{
+    memset(hg, 0, sizeof(GimbalControl_Handle_t));
+
+    /* ---- Complementary Filters ---- */
+    CompFilter_Init(&hg->cf_frame,  GIMBAL_CF_ALPHA);
+    CompFilter_Init(&hg->cf_camera, GIMBAL_CF_ALPHA);
+
+    /* ---- Pitch Angle PID (outer loop) ----
+     *  Input:  relative pitch angle error (°)
+     *  Output: desired pitch rate (°/s) → inner loop setpoint
+     */
+    PID_Init(&hg->pid_pitch_angle,
              GIMBAL_PITCH_ANGLE_KP,
              GIMBAL_PITCH_ANGLE_KI,
              GIMBAL_PITCH_ANGLE_KD,
-             GIMBAL_RATE_SP_MIN,   /* out = rate setpoint */
+             GIMBAL_RATE_SP_MIN,
              GIMBAL_RATE_SP_MAX);
-    /* Bộ lọc D nhẹ để tránh nhiễu trên góc */
-    PID_SetDerivativeFilter(&hgimbal->pid_pitch_angle, 0.15f);
-    /* Giới hạn integral hẹp hơn để tránh windup khi servo bị chặn cơ học */
-    PID_SetIntegralLimits(&hgimbal->pid_pitch_angle, -50.0f, 50.0f);
+    PID_SetDerivativeFilter(&hg->pid_pitch_angle, GIMBAL_D_FILTER_ANGLE);
+    PID_SetIntegralLimits(&hg->pid_pitch_angle,
+                          -GIMBAL_INT_LIMIT_ANGLE, GIMBAL_INT_LIMIT_ANGLE);
 
-    /* ---- Cascaded PID – Pitch Rate (vòng trong) ---- */
-    PID_Init(&hgimbal->pid_pitch_rate,
+    /* ---- Pitch Rate PID (inner loop) ----
+     *  Input:  rate error (°/s)
+     *  Output: servo offset (µs)
+     */
+    PID_Init(&hg->pid_pitch_rate,
              GIMBAL_PITCH_RATE_KP,
              GIMBAL_PITCH_RATE_KI,
              GIMBAL_PITCH_RATE_KD,
-             GIMBAL_PID_OUT_MIN,   /* out = servo offset µs */
+             GIMBAL_PID_OUT_MIN,
              GIMBAL_PID_OUT_MAX);
-    PID_SetDerivativeFilter(&hgimbal->pid_pitch_rate, 0.1f);
-    PID_SetIntegralLimits(&hgimbal->pid_pitch_rate, -100.0f, 100.0f);
+    PID_SetDerivativeFilter(&hg->pid_pitch_rate, GIMBAL_D_FILTER_RATE);
+    PID_SetIntegralLimits(&hg->pid_pitch_rate,
+                          -GIMBAL_INT_LIMIT_RATE, GIMBAL_INT_LIMIT_RATE);
 
-    /* ---- Rate PID – Yaw ---- */
-    PID_Init(&hgimbal->pid_yaw_rate,
+    /* ---- Yaw Rate PID (single loop) ----
+     *  Input:  relative yaw rate error (°/s)
+     *  Output: servo offset (µs)
+     *  setpoint_yaw_rate = 0 → lock yaw (kháng lại xoay ngang)
+     */
+    PID_Init(&hg->pid_yaw_rate,
              GIMBAL_YAW_RATE_KP,
              GIMBAL_YAW_RATE_KI,
              GIMBAL_YAW_RATE_KD,
              GIMBAL_PID_OUT_MIN,
              GIMBAL_PID_OUT_MAX);
-    PID_SetDerivativeFilter(&hgimbal->pid_yaw_rate, 0.1f);
-    PID_SetIntegralLimits(&hgimbal->pid_yaw_rate, -80.0f, 80.0f);
+    PID_SetDerivativeFilter(&hg->pid_yaw_rate, GIMBAL_D_FILTER_RATE);
+    PID_SetIntegralLimits(&hg->pid_yaw_rate,
+                          -GIMBAL_INT_LIMIT_RATE, GIMBAL_INT_LIMIT_RATE);
 
-    /* ---- Setpoint mặc định ---- */
-    hgimbal->pitch_setpoint  = 0.0f;   /* Cân bằng ngang */
-    hgimbal->yaw_rate_sp     = 0.0f;   /* Lock yaw */
+    /* ---- Setpoints & Feedforward ---- */
+    hg->pitch_setpoint     = 0.0f;
+    hg->yaw_rate_setpoint  = 0.0f;
+    hg->kff_pitch          = GIMBAL_KFF_PITCH;
+    hg->kff_yaw            = GIMBAL_KFF_YAW;
 
-    /* ---- Servo về vị trí trung tâm ---- */
-    hgimbal->servo_pitch_us = GIMBAL_SERVO_CENTER_US;
-    hgimbal->servo_yaw_us   = GIMBAL_SERVO_CENTER_US;
+    /* ---- Servo về center ---- */
+    hg->servo_pitch_us = GIMBAL_SERVO_CENTER_US;
+    hg->servo_yaw_us   = GIMBAL_SERVO_CENTER_US;
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, GIMBAL_SERVO_CENTER_US);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, GIMBAL_SERVO_CENTER_US);
 
-    hgimbal->last_tick   = HAL_GetTick();
-    hgimbal->initialized = 1U;
+    hg->last_tick   = HAL_GetTick();
+    hg->initialized = 1;
+
+    /* Init filter với dữ liệu IMU hiện tại (nếu IMU đã init) */
+    if (hImu->frame.initialized && hImu->camera.initialized) {
+        ImuDual_Read(hImu);
+        CompFilter_Reset(&hg->cf_frame,
+                         hImu->frame.scaled.accel_x,
+                         hImu->frame.scaled.accel_y,
+                         hImu->frame.scaled.accel_z);
+        CompFilter_Reset(&hg->cf_camera,
+                         hImu->camera.scaled.accel_x,
+                         hImu->camera.scaled.accel_y,
+                         hImu->camera.scaled.accel_z);
+    }
+
+    printf("[GIMB] Init OK. Pitch SP=%.1f° | CF alpha=%.3f\r\n",
+           hg->pitch_setpoint, GIMBAL_CF_ALPHA);
 }
 
-void Gimbal_Reset(GimbalControl_Handle_t *hgimbal, MPU6050_Handle_t *hMpu)
+void Gimbal_Tick(GimbalControl_Handle_t *hg, ImuDual_Handle_t *hImu)
 {
-    /* Lấy góc hiện tại từ Accel để khởi tạo Kalman (tránh bump khi bật) */
-    float ax = hMpu->scaled.accel_x;
-    float ay = hMpu->scaled.accel_y;
-    float az = hMpu->scaled.accel_z;
+    if (!hg->initialized) return;
 
-    float init_pitch = atan2f(ax, sqrtf(ay * ay + az * az)) * 57.29577951f;
-
-    Kalman_Reset(&hgimbal->kalman_pitch, init_pitch);
-
-    /* Reset tất cả PID để xóa tích lũy cũ */
-    PID_Reset(&hgimbal->pid_pitch_angle);
-    PID_Reset(&hgimbal->pid_pitch_rate);
-    PID_Reset(&hgimbal->pid_yaw_rate);
-
-    /* Servo về trung tâm */
-    hgimbal->servo_pitch_us = GIMBAL_SERVO_CENTER_US;
-    hgimbal->servo_yaw_us   = GIMBAL_SERVO_CENTER_US;
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, GIMBAL_SERVO_CENTER_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, GIMBAL_SERVO_CENTER_US);
-
-    hgimbal->last_tick = HAL_GetTick();
-}
-
-void Gimbal_Update(GimbalControl_Handle_t *hgimbal, MPU6050_Handle_t *hMpu)
-{
-    if (!hgimbal->initialized) return;
-
-    /* ---- Tính dt (giây) ---- */
+    /* ====================================================================
+     *  Bước 1: Đo dt thực tế
+     *  Mặc dù TIM6 kích hoạt đều đặn 2ms, đo dt thực để PID chính xác
+     *  trong trường hợp main loop có jitter nhỏ.
+     * ==================================================================== */
     uint32_t now = HAL_GetTick();
-    float dt = (float)(now - hgimbal->last_tick) / 1000.0f;
-    hgimbal->last_tick = now;
+    float dt = (float)(now - hg->last_tick) * 0.001f;
+    hg->last_tick = now;
 
-    /* Bảo vệ: dt phải hợp lệ */
-    if (dt <= 0.0f || dt > 0.1f) return;
+    /* Bảo vệ: nếu dt quá lớn (hệ thống bị block), skip tick này */
+    if (dt <= 0.0001f || dt > GIMBAL_CTRL_DT_MAX) {
+        return;
+    }
 
-    /* ---- Lấy dữ liệu cảm biến từ MPU6050 handle ---- */
-    float ax = hMpu->scaled.accel_x;
-    float ay = hMpu->scaled.accel_y;
-    float az = hMpu->scaled.accel_z;
+    /* ====================================================================
+     *  Bước 2: Đọc cả 2 IMU
+     * ==================================================================== */
+    if (ImuDual_Read(hImu) != HAL_OK) {
+        /* Nếu I2C fail, giữ nguyên servo ở vị trí cuối */
+        return;
+    }
 
-    /* Góc Pitch từ Accel (đo lường nhiễu, dài hạn ổn định) */
-    float accel_pitch = atan2f(ax, sqrtf(ay * ay + az * az)) * 57.29577951f;
+    /* Shortcut aliases */
+    ImuScaled_t *fr = &hImu->frame.scaled;
+    ImuScaled_t *ca = &hImu->camera.scaled;
 
-    /* Tốc độ góc từ Gyro (°/s) */
-    float gyro_x = hMpu->scaled.gyro_x;  /* Pitch rate */
-    float gyro_z = hMpu->scaled.gyro_z;  /* Yaw rate   */
+    /* ====================================================================
+     *  Bước 3: Complementary Filter cho từng IMU
+     *  cf_frame: pitch và roll của frame/body
+     *  cf_camera: pitch và roll của camera/platform
+     * ==================================================================== */
+    CompFilter_Update(&hg->cf_frame,
+                      fr->accel_x, fr->accel_y, fr->accel_z,
+                      fr->gyro_x, fr->gyro_y,
+                      dt);
 
-    /* ================================================================
-     *  PITCH AXIS – Cascaded PID
-     * ================================================================ */
+    CompFilter_Update(&hg->cf_camera,
+                      ca->accel_x, ca->accel_y, ca->accel_z,
+                      ca->gyro_x, ca->gyro_y,
+                      dt);
 
-    /* Bước 1: Kalman Filter → ước lượng góc Pitch tối ưu */
-    float pitch_angle = Kalman_Update(&hgimbal->kalman_pitch,
-                                       accel_pitch,
-                                       gyro_x,
+    /* ====================================================================
+     *  Bước 4: Relative Error — Tim hiệu giữa camera và frame
+     *
+     *  err_pitch = camera_pitch - frame_pitch - setpoint_pitch
+     *
+     *  Diễn giải:
+     *  - Nếu frame nghiêng +10° và camera vẫn ở 0°  → err = 0 - 10 - 0 = -10
+     *    → Cần servo compensate +10° để camera luôn ở 0° tuyệt đối
+     *  - Nếu setpoint = +5° (camera hướng xuống 5°)
+     *    → err = camera_pitch - frame_pitch - 5
+     * ==================================================================== */
+    float err_pitch = (hg->cf_camera.pitch - hg->cf_frame.pitch)
+                      - hg->pitch_setpoint;
+
+    /* Yaw: dùng gyro rate (không có accel reference cho yaw)
+     * err_yaw = (camera_gyro_z - frame_gyro_z) - setpoint_yaw_rate
+     * setpoint_yaw_rate = 0 → lock yaw (kháng lại xoay ngang của frame) */
+    float err_yaw_rate = (ca->gyro_z - fr->gyro_z) - hg->yaw_rate_setpoint;
+
+    /* ====================================================================
+     *  Bước 5: PITCH CASCADED PID
+     *
+     *  Vòng ngoài (Angle PID):
+     *    Input:  err_pitch (°)
+     *    Output: rate_setpoint (°/s) — muốn camera xoay bao nhanh
+     *
+     *  Vòng trong (Rate PID):
+     *    Input:  rate_setpoint - camera_actual_pitch_rate
+     *    Output: servo_offset (µs)
+     * ==================================================================== */
+    float pitch_rate_sp = PID_Compute(&hg->pid_pitch_angle,
+                                       0.0f, -err_pitch,  /* error = 0 - (-err) */
                                        dt);
 
-    /* Bước 2: Angle PID (vòng ngoài)
-     *   Input:  góc mong muốn (setpoint) vs góc thực (Kalman output)
-     *   Output: tốc độ góc mong muốn (rate_setpoint) */
-    float pitch_rate_sp = PID_Compute(&hgimbal->pid_pitch_angle,
-                                       hgimbal->pitch_setpoint,
-                                       pitch_angle,
-                                       dt);
+    /* Rate feedback là gyro của camera (tốc độ góc thực của platform) */
+    float pitch_servo_offset = PID_Compute(&hg->pid_pitch_rate,
+                                            pitch_rate_sp,
+                                            ca->gyro_x,
+                                            dt);
 
-    /* Bước 3: Rate PID (vòng trong)
-     *   Input:  tốc độ góc mong muốn (từ Angle PID) vs tốc độ góc thực (Gyro)
-     *   Output: offset servo (µs) */
-    float pitch_output = PID_Compute(&hgimbal->pid_pitch_rate,
-                                      pitch_rate_sp,
-                                      gyro_x,
-                                      dt);
+    /* Feedforward: bù ngay từ frame gyro, không đợi PID phản ứng */
+    pitch_servo_offset += hg->kff_pitch * fr->gyro_x;
 
-    /* Bước 4: Ghi servo Pitch = CENTER + offset */
-    float servo_pitch_f = (float)GIMBAL_SERVO_CENTER_US + pitch_output;
-    hgimbal->servo_pitch_us = _clamp_u32(servo_pitch_f,
-                                          GIMBAL_SERVO_MIN_US,
-                                          GIMBAL_SERVO_MAX_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, hgimbal->servo_pitch_us);
+    /* ====================================================================
+     *  Bước 6: YAW RATE PID (single loop)
+     * ==================================================================== */
+    float yaw_servo_offset = PID_Compute(&hg->pid_yaw_rate,
+                                          0.0f, -err_yaw_rate,
+                                          dt);
 
-    /* ================================================================
-     *  YAW AXIS – Rate PID đơn (không có Accel reference cho Yaw)
-     * ================================================================ */
+    yaw_servo_offset += hg->kff_yaw * fr->gyro_z;
 
-    /* Rate PID:  error = yaw_rate_sp - gyro_z
-     *   setpoint = 0 → giữ nguyên hướng (lock yaw)
-     *   Gyro Z là chiều quay ngang của gimbal                          */
-    float yaw_output = PID_Compute(&hgimbal->pid_yaw_rate,
-                                    hgimbal->yaw_rate_sp,
-                                    gyro_z,
-                                    dt);
+    /* ====================================================================
+     *  Bước 7: Servo Output
+     *
+     *  servo_us = CENTER + SIGN × offset
+     *  Clamp vào [SERVO_MIN, SERVO_MAX]
+     * ==================================================================== */
+    float p_us = (float)GIMBAL_SERVO_CENTER_US
+                 + GIMBAL_SERVO_PITCH_SIGN * pitch_servo_offset;
+    float y_us = (float)GIMBAL_SERVO_CENTER_US
+                 + GIMBAL_SERVO_YAW_SIGN * yaw_servo_offset;
 
-    float servo_yaw_f = (float)GIMBAL_SERVO_CENTER_US + yaw_output;
-    hgimbal->servo_yaw_us = _clamp_u32(servo_yaw_f,
-                                        GIMBAL_SERVO_MIN_US,
-                                        GIMBAL_SERVO_MAX_US);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, hgimbal->servo_yaw_us);
+    hg->servo_pitch_us = _servo_clamp(p_us);
+    hg->servo_yaw_us   = _servo_clamp(y_us);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, hg->servo_pitch_us);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, hg->servo_yaw_us);
+
+    /* ====================================================================
+     *  Bước 8: Copy telemetry (atomic copy cho main loop logging)
+     * ==================================================================== */
+    hg->telem.frame_pitch    = hg->cf_frame.pitch;
+    hg->telem.frame_roll     = hg->cf_frame.roll;
+    hg->telem.cam_pitch      = hg->cf_camera.pitch;
+    hg->telem.cam_roll       = hg->cf_camera.roll;
+    hg->telem.err_pitch      = err_pitch;
+    hg->telem.err_yaw_rate   = err_yaw_rate;
+    hg->telem.servo_pitch_us = (float)hg->servo_pitch_us;
+    hg->telem.servo_yaw_us   = (float)hg->servo_yaw_us;
+    hg->telem.frame_gyro_z   = fr->gyro_z;
+    hg->telem.loop_count++;
 }
 
-void Gimbal_SetPitchSetpoint(GimbalControl_Handle_t *hgimbal, float pitch_deg)
+void Gimbal_Update(GimbalControl_Handle_t *hg)
 {
-    hgimbal->pitch_setpoint = pitch_deg;
+    /* Hàm này gọi từ main loop — in telemetry mỗi 200ms
+     * (không dùng HAL_Delay — dùng timestamp) */
+    static uint32_t last_log = 0;
+    uint32_t now = HAL_GetTick();
+
+    if (now - last_log >= 200) {
+        last_log = now;
+        /* Snapshot telemetry (không cần atomic vì float copy trong Cortex-M4) */
+        GimbalTelemetry_t t = hg->telem;
+        printf("[GIMB] F_P:%.1f F_R:%.1f | C_P:%.1f C_R:%.1f "
+               "| eP:%.2f eY:%.2f | SrvP:%.0f SrvY:%.0f | N:%lu\r\n",
+               t.frame_pitch, t.frame_roll,
+               t.cam_pitch,   t.cam_roll,
+               t.err_pitch,   t.err_yaw_rate,
+               t.servo_pitch_us, t.servo_yaw_us,
+               t.loop_count);
+    }
 }
 
-void Gimbal_SetYawRateSetpoint(GimbalControl_Handle_t *hgimbal, float yaw_rate_dps)
+void Gimbal_Reset(GimbalControl_Handle_t *hg, ImuDual_Handle_t *hImu)
 {
-    hgimbal->yaw_rate_sp = yaw_rate_dps;
+    PID_Reset(&hg->pid_pitch_angle);
+    PID_Reset(&hg->pid_pitch_rate);
+    PID_Reset(&hg->pid_yaw_rate);
+
+    if (hImu->frame.initialized && hImu->camera.initialized) {
+        ImuDual_Read(hImu);
+        CompFilter_Reset(&hg->cf_frame,
+                         hImu->frame.scaled.accel_x,
+                         hImu->frame.scaled.accel_y,
+                         hImu->frame.scaled.accel_z);
+        CompFilter_Reset(&hg->cf_camera,
+                         hImu->camera.scaled.accel_x,
+                         hImu->camera.scaled.accel_y,
+                         hImu->camera.scaled.accel_z);
+    }
+
+    hg->servo_pitch_us = GIMBAL_SERVO_CENTER_US;
+    hg->servo_yaw_us   = GIMBAL_SERVO_CENTER_US;
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, GIMBAL_SERVO_CENTER_US);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, GIMBAL_SERVO_CENTER_US);
+
+    hg->last_tick = HAL_GetTick();
+    printf("[GIMB] Reset done.\r\n");
 }
 
-void Gimbal_TunePitchPID(GimbalControl_Handle_t *hgimbal,
-                          float angle_Kp, float angle_Ki, float angle_Kd,
-                          float rate_Kp,  float rate_Ki,  float rate_Kd)
-{
-    PID_SetGains(&hgimbal->pid_pitch_angle, angle_Kp, angle_Ki, angle_Kd);
-    PID_SetGains(&hgimbal->pid_pitch_rate,  rate_Kp,  rate_Ki,  rate_Kd);
+/* ---- Setpoint ---- */
+void Gimbal_SetPitchDeg(GimbalControl_Handle_t *hg, float deg) {
+    hg->pitch_setpoint = _clampf(deg, -60.0f, 60.0f);
+}
+void Gimbal_SetYawRateDps(GimbalControl_Handle_t *hg, float dps) {
+    hg->yaw_rate_setpoint = _clampf(dps, -90.0f, 90.0f);
 }
 
-void Gimbal_TuneYawPID(GimbalControl_Handle_t *hgimbal,
-                        float Kp, float Ki, float Kd)
+/* ---- Tuning ---- */
+void Gimbal_TunePitch(GimbalControl_Handle_t *hg,
+                      float aKp, float aKi, float aKd,
+                      float rKp, float rKi, float rKd)
 {
-    PID_SetGains(&hgimbal->pid_yaw_rate, Kp, Ki, Kd);
+    PID_SetGains(&hg->pid_pitch_angle, aKp, aKi, aKd);
+    PID_SetGains(&hg->pid_pitch_rate,  rKp, rKi, rKd);
+}
+void Gimbal_TuneYaw(GimbalControl_Handle_t *hg, float Kp, float Ki, float Kd) {
+    PID_SetGains(&hg->pid_yaw_rate, Kp, Ki, Kd);
+}
+void Gimbal_SetFeedforward(GimbalControl_Handle_t *hg,
+                            float kff_pitch, float kff_yaw)
+{
+    hg->kff_pitch = kff_pitch;
+    hg->kff_yaw   = kff_yaw;
+}
+void Gimbal_SetFilterAlpha(GimbalControl_Handle_t *hg, float alpha) {
+    CompFilter_SetAlpha(&hg->cf_frame,  alpha);
+    CompFilter_SetAlpha(&hg->cf_camera, alpha);
+}
+
+/* ---- CLI ---- */
+void Gimbal_CLI_Process(GimbalControl_Handle_t *hg, const char *line)
+{
+    if (!line || line[0] == '\0') return;
+
+    float a, b, c, d, e, f;
+
+    switch (line[0]) {
+    case 'p':  /* p Kp Ki Kd — pitch angle PID */
+        if (sscanf(line + 1, "%f %f %f", &a, &b, &c) == 3) {
+            PID_SetGains(&hg->pid_pitch_angle, a, b, c);
+            printf("[CLI] Pitch Angle PID: Kp=%.3f Ki=%.3f Kd=%.3f\r\n", a, b, c);
+        }
+        break;
+    case 'P':  /* P Kp Ki Kd — pitch rate PID */
+        if (sscanf(line + 1, "%f %f %f", &a, &b, &c) == 3) {
+            PID_SetGains(&hg->pid_pitch_rate, a, b, c);
+            printf("[CLI] Pitch Rate PID: Kp=%.3f Ki=%.3f Kd=%.3f\r\n", a, b, c);
+        }
+        break;
+    case 'y':  /* y Kp Ki Kd — yaw rate PID */
+        if (sscanf(line + 1, "%f %f %f", &a, &b, &c) == 3) {
+            PID_SetGains(&hg->pid_yaw_rate, a, b, c);
+            printf("[CLI] Yaw Rate PID: Kp=%.3f Ki=%.3f Kd=%.3f\r\n", a, b, c);
+        }
+        break;
+    case 'f':  /* f kff_pitch kff_yaw — feedforward */
+        if (sscanf(line + 1, "%f %f", &a, &b) == 2) {
+            Gimbal_SetFeedforward(hg, a, b);
+            printf("[CLI] Feedforward: kff_pitch=%.3f kff_yaw=%.3f\r\n", a, b);
+        }
+        break;
+    case 'a':  /* a alpha — comp filter alpha */
+        if (sscanf(line + 1, "%f", &a) == 1) {
+            Gimbal_SetFilterAlpha(hg, a);
+            printf("[CLI] CompFilter alpha=%.4f\r\n", a);
+        }
+        break;
+    case 's':  /* s pitch_deg — set pitch setpoint */
+        if (sscanf(line + 1, "%f", &a) == 1) {
+            Gimbal_SetPitchDeg(hg, a);
+            printf("[CLI] Pitch setpoint=%.2f°\r\n", hg->pitch_setpoint);
+        }
+        break;
+    case 'r':  /* r — reset PIDs (không reset filter) */
+        PID_Reset(&hg->pid_pitch_angle);
+        PID_Reset(&hg->pid_pitch_rate);
+        PID_Reset(&hg->pid_yaw_rate);
+        printf("[CLI] PIDs reset.\r\n");
+        break;
+    case 'd':  /* d — dump current state */
+        printf("[CLI] Pitch SP=%.2f | CF_alpha=%.3f | kff_p=%.3f kff_y=%.3f\r\n",
+               hg->pitch_setpoint, hg->cf_frame.alpha,
+               hg->kff_pitch, hg->kff_yaw);
+        printf("[CLI] Pitch AnglePID: Kp=%.3f Ki=%.3f Kd=%.3f\r\n",
+               hg->pid_pitch_angle.Kp, hg->pid_pitch_angle.Ki,
+               hg->pid_pitch_angle.Kd);
+        printf("[CLI] Pitch RatePID:  Kp=%.3f Ki=%.3f Kd=%.3f\r\n",
+               hg->pid_pitch_rate.Kp, hg->pid_pitch_rate.Ki,
+               hg->pid_pitch_rate.Kd);
+        printf("[CLI] Yaw  RatePID:  Kp=%.3f Ki=%.3f Kd=%.3f\r\n",
+               hg->pid_yaw_rate.Kp, hg->pid_yaw_rate.Ki,
+               hg->pid_yaw_rate.Kd);
+        printf("[CLI] Loop count: %lu\r\n", (uint32_t)hg->telem.loop_count);
+        break;
+    default:
+        printf("[CLI] Unknown: '%c'. Commands: p P y f a s r d\r\n", line[0]);
+        break;
+    }
+
+    (void)(d); (void)(e); (void)(f);  /* suppress unused warning */
 }

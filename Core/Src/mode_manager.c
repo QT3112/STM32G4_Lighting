@@ -28,7 +28,7 @@
 /* Trạng thái nội bộ (static)                                                 */
 /* -------------------------------------------------------------------------- */
 
-static AppMode  s_mode         = APP_MODE_NORMAL;
+static AppMode  s_mode         = APP_MODE_GIMBAL;
 
 /* Bộ đếm và thời gian cho gesture detection */
 static uint8_t  s_onCount      = 0;       /* Số lần rising edge vào ON-zone  */
@@ -49,7 +49,7 @@ static inline uint8_t isInOnZone(uint32_t pulse)
 
 void Mode_Init(void)
 {
-    s_mode        = APP_MODE_NORMAL;
+    s_mode        = APP_MODE_GIMBAL;
     s_onCount     = 0;
     s_windowStart = 0;
     s_wasInOnZone = 0;
